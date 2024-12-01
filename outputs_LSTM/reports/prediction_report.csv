@@ -1,2 +1,2 @@
 Mean Squared Error,Root Mean Squared Error,Mean Absolute Error,R² Score,Mean Prediction,Std Prediction,Actual Mean,Actual Std,Actual Min,Actual Max,Predicted Min,Predicted Max,Mean Error,Error Std,Max Underestimation,Max Overestimation,Error Range
-1.0213,1.0106,0.7185,0.9451,10.1357,4.0402,10.1483,4.3142,0.01,16.07,0.3924,17.6971,0.0126,1.0105,-3.3685,2.2202,5.5886
+1.0441,1.0218,0.7082,0.9439,10.2446,4.0954,10.1483,4.3142,0.01,16.07,0.14,17.229,-0.0962,1.0173,-4.2462,2.0398,6.286

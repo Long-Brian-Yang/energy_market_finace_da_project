@@ -813,6 +813,80 @@ class JPEXPriceForecastLSTM:
         
         # Return results
         return results
+    def generate_future_predictions_report(self, predictions, time_steps, base_datetime='2024-12-07 00:00:00'):
+        """Generate a detailed future prediction report and save as CSV and markdown."""
+        base_datetime = pd.to_datetime(base_datetime)
+        datetimes = [base_datetime + timedelta(minutes=30 * i) for i in range(time_steps)]
+        
+        # Create DataFrame for future predictions
+        predictions_df = pd.DataFrame({
+            'datetime': datetimes,
+            'predicted_price': predictions,
+            'confidence_lower': predictions * 0.95,
+            'confidence_upper': predictions * 1.05
+        })
+        
+        # Save to CSV
+        predictions_df.to_csv(os.path.join(self.reports_dir, 'future_detailed_predictions.csv'), index=False)
+        print("Future predictions saved to 'future_detailed_predictions.csv'")
+        
+        # Analyze statistics
+        stats = {
+            'Overall Statistics': {
+                'Mean Price': predictions.mean(),
+                'Std Dev': predictions.std(),
+                'Min Price': predictions.min(),
+                'Max Price': predictions.max(),
+                'Price Range': predictions.max() - predictions.min()
+            },
+            'Peak Hours (8:00-20:00)': {
+                'Mean Price': predictions_df[
+                    predictions_df['datetime'].dt.hour.between(8, 19)]['predicted_price'].mean(),
+                'Max Price': predictions_df[
+                    predictions_df['datetime'].dt.hour.between(8, 19)]['predicted_price'].max(),
+                'Peak Hour': predictions_df.loc[
+                    predictions_df['predicted_price'].idxmax(), 'datetime'].strftime('%H:%M')
+            },
+            'Off-Peak Hours': {
+                'Mean Price': predictions_df[
+                    ~predictions_df['datetime'].dt.hour.between(8, 19)]['predicted_price'].mean(),
+                'Min Price': predictions_df[
+                    ~predictions_df['datetime'].dt.hour.between(8, 19)]['predicted_price'].min(),
+                'Lowest Hour': predictions_df.loc[
+                    predictions_df['predicted_price'].idxmin(), 'datetime'].strftime('%H:%M')
+            }
+        }
+        
+        # Generate markdown report
+        report = f"""
+    # Future Electricity Price Forecast Report
+
+    ## Overall Statistics
+    - Mean Price: {stats['Overall Statistics']['Mean Price']:.2f} JPY/kWh
+    - Standard Deviation: {stats['Overall Statistics']['Std Dev']:.2f} JPY/kWh
+    - Price Range: {stats['Overall Statistics']['Price Range']:.2f} JPY/kWh
+    - Minimum Price: {stats['Overall Statistics']['Min Price']:.2f} JPY/kWh
+    - Maximum Price: {stats['Overall Statistics']['Max Price']:.2f} JPY/kWh
+
+    ## Peak Hours Analysis (8:00-20:00)
+    - Average Peak Price: {stats['Peak Hours (8:00-20:00)']['Mean Price']:.2f} JPY/kWh
+    - Maximum Peak Price: {stats['Peak Hours (8:00-20:00)']['Max Price']:.2f} JPY/kWh
+    - Hour with Highest Price: {stats['Peak Hours (8:00-20:00)']['Peak Hour']}
+
+    ## Off-Peak Hours Analysis
+    - Average Off-Peak Price: {stats['Off-Peak Hours']['Mean Price']:.2f} JPY/kWh
+    - Minimum Off-Peak Price: {stats['Off-Peak Hours']['Min Price']:.2f} JPY/kWh
+    - Hour with Lowest Price: {stats['Off-Peak Hours']['Lowest Hour']}
+
+    ## Key Findings
+    1. The highest prices are expected during {stats['Peak Hours (8:00-20:00)']['Peak Hour']}.
+    2. The lowest prices are expected during {stats['Off-Peak Hours']['Lowest Hour']}.
+    3. The average price difference between peak and off-peak hours is {stats['Peak Hours (8:00-20:00)']['Mean Price'] - stats['Off-Peak Hours']['Mean Price']:.2f} JPY/kWh.
+    """
+        self.generate_report(report, report_name='future_forecast_report.md')
+        print("Future forecast report saved to 'future_forecast_report.md'")
+        
+        return stats, predictions_df
 
 
 def main():
@@ -936,8 +1010,13 @@ def main():
         # Generate detailed report
         print("\nGenerating detailed prediction report...")
         report = forecaster.generate_prediction_report(X_test, y_test, predictions, metrics)
-        
-        # Example of performing sensitivity analysis
+
+        print("Generating future predictions report...")
+        future_predictions = forecaster.predict(X_test[:48])
+        stats, predictions_df = forecaster.generate_future_predictions_report(future_predictions, time_steps=48)
+        print("Future predictions report and CSV generated.")
+
+        # performing sensitivity analysis
         print("\nPerforming sensitivity analysis on 'trading_volume'...")
         change_percentages = [-10, -5, 0, 5, 10]
         sensitivity_results = forecaster.perform_sensitivity_analysis(df, 'trading_volume', change_percentages)
