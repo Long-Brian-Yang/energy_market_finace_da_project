@@ -164,22 +164,15 @@ class JPEXPriceForecastXGB:
         }
     
     def plot_feature_importance(self):
-        """Plot feature importance."""
-        importance = pd.DataFrame({
-            'feature': self.model.feature_names_in_,
-            'importance': self.model.feature_importances_
-        })
-        importance = importance.sort_values('importance', ascending=False)
-        
+        """Plot feature importance using xgboost's built-in function."""
         plt.figure(figsize=(12, 6))
-        sns.barplot(data=importance.head(20), x='importance', y='feature')
+        xgb.plot_importance(self.model, max_num_features=20)
         plt.title('Top 20 Most Important Features')
         plt.tight_layout()
-        plt.savefig(os.path.join(self.plots_dir, 'feature_importance.png'))
+        output_path = os.path.join(self.plots_dir, 'feature_importance.png')
+        plt.savefig(output_path)
         plt.close()
-        
-        return importance
-    
+
     def visualize_predictions(self, X_test, y_test, predictions):
         """Create visualizations for predictions and errors."""
         # Create plots directory if it doesn't exist
@@ -520,7 +513,7 @@ class JPEXPriceForecastXGB:
                 
         return report
 
-    # 添加经济学分析方法
+    # add the following methods
     def plot_supply_demand_curves(self, df, time_period=None):
         """Plot supply and demand curves for a specific time period."""
         # If time_period is None, use the last available period
@@ -775,6 +768,13 @@ def main():
         print("\nGenerating detailed prediction report...")
         report = forecaster.generate_prediction_report(X_test, y_test, predictions, metrics)
         
+        print("Plotting feature importance...")
+        importance_df = forecaster.plot_feature_importance()
+        if importance_df is not None:
+            print("Feature importance plot saved.")
+        else:
+            print("Failed to plot feature importance.")
+
         # Predict prices for December 7, 2024
         print("\nGenerating predictions for December 7, 2024...")
         future_predictions = forecaster.predict_specific_date(df)
