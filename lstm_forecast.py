@@ -1,3 +1,12 @@
+import shap
+from sklearn.decomposition import PCA
+from statsmodels.tsa.seasonal import seasonal_decompose
+from scipy.stats import shapiro, normaltest
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.stattools import adfuller
+from torch.utils.data import DataLoader, TensorDataset
+import torch.nn as nn
+import torch
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -10,19 +19,11 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 
 # For statistical tests
-from statsmodels.tsa.stattools import adfuller
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-from scipy.stats import shapiro, normaltest
 
 # For additional plots
-from statsmodels.tsa.seasonal import seasonal_decompose
-from sklearn.decomposition import PCA
-import shap
+
 
 class JPEXPriceForecastLSTM:
     def __init__(self, output_dir='outputs_LSTM'):
@@ -32,26 +33,27 @@ class JPEXPriceForecastLSTM:
         self.feature_columns = None
         self.output_dir = output_dir
         self.create_output_directories()
-        self.sequence_length = 48 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.sequence_length = 48
+        self.device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
         self.training_losses = []
         self.validation_losses = []
-        
+
     def create_output_directories(self):
         """Create base output directories."""
         self.plots_dir = os.path.join(self.output_dir, 'plots')
         self.reports_dir = os.path.join(self.output_dir, 'reports')
         os.makedirs(self.plots_dir, exist_ok=True)
         os.makedirs(self.reports_dir, exist_ok=True)
-        
+
     def load_data(self, file_path):
         """Load and preprocess JPEX data."""
         # Read data
         df = pd.read_csv(file_path, encoding='shift-jis')
-        
+
         columns = {
             '日付': 'date',
-            '受渡日': 'date',  
+            '受渡日': 'date',
             '時刻コード': 'time_code',
             '売り入札量(kWh)': 'sell_volume',
             '買い入札量(kWh)': 'buy_volume',
@@ -59,24 +61,26 @@ class JPEXPriceForecastLSTM:
             'システムプライス(円/kWh)': 'system_price'
         }
         df = df.rename(columns=columns)
-        
-        df['date'] = '2024-01-01' 
+
+        df['date'] = '2024-01-01'
         df['date'] = pd.to_datetime(df['date'])
         print("Added 'date' column manually.")
-        
+
         # Create time features
         df['hour'] = (df['time_code'] - 1) // 2
         df['minute'] = ((df['time_code'] - 1) % 2) * 30
 
         # Create 'datetime' column
-        df['datetime'] = df['date'] + pd.to_timedelta(df['hour'], unit='h') + pd.to_timedelta(df['minute'], unit='m')
-        
+        df['datetime'] = df['date'] + \
+            pd.to_timedelta(df['hour'], unit='h') + \
+            pd.to_timedelta(df['minute'], unit='m')
+
         # Calculate supply-demand imbalance
         df['volume_imbalance'] = df['buy_volume'] - df['sell_volume']
         df['volume_ratio'] = df['buy_volume'] / df['sell_volume']
-        
+
         return df
-    
+
     def create_features(self, df):
         """Create features."""
         # Lag features for price and trading volume
@@ -84,21 +88,24 @@ class JPEXPriceForecastLSTM:
             df[f'price_lag_{i}'] = df['system_price'].shift(i)
             df[f'volume_lag_{i}'] = df['trading_volume'].shift(i)
             df[f'imbalance_lag_{i}'] = df['volume_imbalance'].shift(i)
-        
+
         # Rolling statistical features
         windows = [48, 96]  # 24 hours, 48 hours
         for window in windows:
             # Price statistics
-            df[f'price_ma_{window}'] = df['system_price'].rolling(window=window).mean()
-            df[f'price_std_{window}'] = df['system_price'].rolling(window=window).std()
+            df[f'price_ma_{window}'] = df['system_price'].rolling(
+                window=window).mean()
+            df[f'price_std_{window}'] = df['system_price'].rolling(
+                window=window).std()
             # Volume statistics
-            df[f'volume_ma_{window}'] = df['trading_volume'].rolling(window=window).mean()
-        
+            df[f'volume_ma_{window}'] = df['trading_volume'].rolling(
+                window=window).mean()
+
         # Remove rows with NaN values
         df = df.dropna()
-        
+
         return df
-    
+
     def prepare_features(self, df):
         """Prepare model input features."""
         features = [
@@ -106,74 +113,79 @@ class JPEXPriceForecastLSTM:
             'hour', 'minute', 'time_code',
             'trading_volume', 'volume_imbalance', 'volume_ratio',
         ]
-        
+
         # Add created features
         lag_features = [col for col in df.columns if 'lag_' in col]
-        ma_features = [col for col in df.columns if 'ma_' in col or 'std_' in col]
-        
+        ma_features = [
+            col for col in df.columns if 'ma_' in col or 'std_' in col]
+
         features.extend(lag_features)
         features.extend(ma_features)
-        
+
         self.feature_columns = features
         X = df[features]
         y = df['system_price']
-        
+
         return X, y
-    
+
     def scale_data(self, X):
         """Scale data using MinMaxScaler."""
         X_scaled = self.scaler.fit_transform(X)
         return X_scaled
-    
+
     def create_sequences(self, X_scaled, y, sequence_length):
         """Create sequences for LSTM input."""
         X_seq = []
         y_seq = []
         for i in range(sequence_length, len(X_scaled)):
-            X_seq.append(X_scaled[i-sequence_length:i])
+            X_seq.append(X_scaled[i - sequence_length:i])
             y_seq.append(y.iloc[i])
         return np.array(X_seq), np.array(y_seq)
-    
+
     class LSTMModel(nn.Module):
         def __init__(self, input_size, hidden_size=128, num_layers=2):
             super().__init__()
-            self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+            self.lstm = nn.LSTM(
+                input_size,
+                hidden_size,
+                num_layers,
+                batch_first=True)
             self.fc = nn.Linear(hidden_size, 1)
-            
+
         def forward(self, x):
             out, hidden = self.lstm(x)
             self.hidden_states = out  # Save hidden states for visualization
             out = out[:, -1, :]  # Get the last time step output
             out = self.fc(out)
             return out.squeeze()
-    
+
     def train_model(self, X_train, y_train, X_val=None, y_val=None):
         """Train LSTM model."""
         # Initialize the model
         input_size = X_train.shape[2]
         self.model = self.LSTMModel(input_size).to(self.device)
-        
+
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
-        
+
         # Convert data to tensors
         X_train = torch.tensor(X_train, dtype=torch.float32).to(self.device)
         y_train = torch.tensor(y_train, dtype=torch.float32).to(self.device)
-        
+
         if X_val is not None and y_val is not None:
             X_val = torch.tensor(X_val, dtype=torch.float32).to(self.device)
             y_val = torch.tensor(y_val, dtype=torch.float32).to(self.device)
-        
+
         # Create DataLoader
         train_dataset = TensorDataset(X_train, y_train)
         train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        
+
         num_epochs = 100
         best_val_loss = np.inf
         patience = 10
         patience_counter = 0
         gradient_norms = []
-        
+
         for epoch in range(num_epochs):
             self.model.train()
             train_losses = []
@@ -185,7 +197,7 @@ class JPEXPriceForecastLSTM:
                 loss.backward()
                 # clip gradients
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5)
-                
+
                 # calculate gradient norm
                 total_norm = 0.0
                 for p in self.model.parameters():
@@ -194,54 +206,63 @@ class JPEXPriceForecastLSTM:
                         total_norm += param_norm.item() ** 2
                 total_norm = total_norm ** 0.5
                 epoch_grad_norm.append(total_norm)
-                
+
                 optimizer.step()
                 train_losses.append(loss.item())
-            
+
             avg_train_loss = np.mean(train_losses)
             avg_grad_norm = np.mean(epoch_grad_norm)
             self.training_losses.append(avg_train_loss)
             gradient_norms.append(avg_grad_norm)
-            
+
             if X_val is not None and y_val is not None:
                 self.model.eval()
                 with torch.no_grad():
                     val_outputs = self.model(X_val)
                     val_loss = criterion(val_outputs, y_val).item()
                 self.validation_losses.append(val_loss)
-                print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}, Avg Grad Norm: {avg_grad_norm:.4f}")
-                
+                print(
+                    f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}, Avg Grad Norm: {avg_grad_norm:.4f}")
+
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     patience_counter = 0
-                    torch.save(self.model.state_dict(), os.path.join(self.output_dir, 'best_model.pth'))
+                    torch.save(
+                        self.model.state_dict(), os.path.join(
+                            self.output_dir, 'best_model.pth'))
                 else:
                     patience_counter += 1
                     if patience_counter >= patience:
                         print("Early stopping")
                         break
             else:
-                print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.6f}, Avg Grad Norm: {avg_grad_norm:.4f}")
-        
+                print(
+                    f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.6f}, Avg Grad Norm: {avg_grad_norm:.4f}")
+
         # Load the best model
         if X_val is not None and y_val is not None:
-            self.model.load_state_dict(torch.load(os.path.join(self.output_dir, 'best_model.pth')))
-        
+            self.model.load_state_dict(
+                torch.load(
+                    os.path.join(
+                        self.output_dir,
+                        'best_model.pth')))
+
         # Plot gradient norms
         plt.figure(figsize=(10, 6))
-        plt.plot(range(1, len(gradient_norms)+1), gradient_norms, marker='o')
+        plt.plot(range(1, len(gradient_norms) + 1), gradient_norms, marker='o')
         plt.title('Average Gradient Norm per Epoch')
         plt.xlabel('Epoch')
         plt.ylabel('Gradient Norm')
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.plots_dir, 'gradient_norms.png'))
         plt.close()
-    
+
     def predict(self, X, return_hidden_states=False):
         """Generate predictions."""
         if self.model is None:
-            raise ValueError("Model has not been trained yet. Please train the model first.")
-        
+            raise ValueError(
+                "Model has not been trained yet. Please train the model first.")
+
         self.model.eval()
         X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
         with torch.no_grad():
@@ -252,24 +273,25 @@ class JPEXPriceForecastLSTM:
         if return_hidden_states:
             return predictions.flatten(), None
         return predictions.flatten()
-    
+
     def evaluate(self, X_test, y_test):
         """Evaluate model performance."""
         if self.model is None:
-            raise ValueError("Model has not been trained yet. Please train the model first.")
-                
+            raise ValueError(
+                "Model has not been trained yet. Please train the model first.")
+
         predictions = self.predict(X_test)
         mse = mean_squared_error(y_test, predictions)
         mae = mean_absolute_error(y_test, predictions)
         r2 = r2_score(y_test, predictions)
-        
+
         return {
             'mse': mse,
             'mae': mae,
             'r2': r2,
             'rmse': np.sqrt(mse)
         }
-    
+
     def plot_training_curves(self):
         """Plot training and validation loss curves."""
         plt.figure(figsize=(10, 6))
@@ -283,7 +305,7 @@ class JPEXPriceForecastLSTM:
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.plots_dir, 'training_curves.png'))
         plt.close()
-    
+
     def visualize_hidden_states(self, hidden_states):
         """Visualize hidden states over time."""
         if hidden_states is None:
@@ -299,17 +321,21 @@ class JPEXPriceForecastLSTM:
         plt.ylabel('Hidden Unit')
         plt.savefig(os.path.join(self.plots_dir, 'hidden_states.png'))
         plt.close()
-    
+
     def add_attention_layer(self):
         """Add an attention mechanism to the LSTM model."""
         # Attention layer
         class LSTMAttentionModel(nn.Module):
             def __init__(self, input_size, hidden_size=128, num_layers=2):
                 super().__init__()
-                self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+                self.lstm = nn.LSTM(
+                    input_size,
+                    hidden_size,
+                    num_layers,
+                    batch_first=True)
                 self.attention = nn.Linear(hidden_size, 1)
                 self.fc = nn.Linear(hidden_size, 1)
-                
+
             def forward(self, x):
                 lstm_out, _ = self.lstm(x)
                 # calculate attention weights
@@ -319,7 +345,7 @@ class JPEXPriceForecastLSTM:
                 out = self.fc(context)
                 self.attention_weights = attn_weights
                 return out.squeeze()
-        
+
         # Initialize the model with attention
         input_size = len(self.feature_columns)
         self.model = LSTMAttentionModel(input_size).to(self.device)
@@ -328,7 +354,12 @@ class JPEXPriceForecastLSTM:
     def plot_future_forecast(self, future_predictions, time_steps):
         """Plot future price forecast."""
         plt.figure(figsize=(15, 8))
-        plt.plot(range(len(future_predictions)), future_predictions, label='Future Forecast', color='green')
+        plt.plot(
+            range(
+                len(future_predictions)),
+            future_predictions,
+            label='Future Forecast',
+            color='green')
         plt.title('Future Price Forecast')
         plt.xlabel('Future Time Steps')
         plt.ylabel('Price (JPY/kWh)')
@@ -342,20 +373,20 @@ class JPEXPriceForecastLSTM:
         """Create visualizations for predictions and errors."""
         # Create plots directory if it doesn't exist
         os.makedirs(self.plots_dir, exist_ok=True)
-        
+
         # 1. Predictions vs Actual Values
         plt.figure(figsize=(15, 8))
         plt.plot(y_test, label='Actual', color='blue', alpha=0.7)
         plt.plot(predictions, label='Predicted', color='red', alpha=0.7)
-        
+
         # Add 95% confidence interval
         std_dev = np.std(y_test - predictions)
         plt.fill_between(range(len(predictions)),
-                         predictions - 1.96*std_dev,
-                         predictions + 1.96*std_dev,
+                         predictions - 1.96 * std_dev,
+                         predictions + 1.96 * std_dev,
                          alpha=0.2, color='red',
                          label='95% Confidence Interval')
-        
+
         plt.title('Electricity Price Prediction vs Actual Values')
         plt.xlabel('Time Period')
         plt.ylabel('Price (JPY/kWh)')
@@ -363,7 +394,7 @@ class JPEXPriceForecastLSTM:
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.plots_dir, 'prediction_with_ci.png'))
         plt.close()
-        
+
         # 2. Prediction Error Analysis
         errors = y_test - predictions
         plt.figure(figsize=(15, 8))
@@ -373,7 +404,7 @@ class JPEXPriceForecastLSTM:
         plt.xlabel('Time Period')
         plt.ylabel('Error (JPY/kWh)')
         plt.grid(True, alpha=0.3)
-        
+
         plt.subplot(2, 1, 2)
         sns.histplot(errors, bins=50, kde=True)
         plt.title('Error Distribution')
@@ -382,12 +413,12 @@ class JPEXPriceForecastLSTM:
         plt.tight_layout()
         plt.savefig(os.path.join(self.plots_dir, 'error_analysis.png'))
         plt.close()
-        
+
         # 3. Predicted vs Actual Scatter Plot
         plt.figure(figsize=(10, 10))
         plt.scatter(y_test, predictions, alpha=0.5)
-        plt.plot([y_test.min(), y_test.max()], 
-                 [y_test.min(), y_test.max()], 
+        plt.plot([y_test.min(), y_test.max()],
+                 [y_test.min(), y_test.max()],
                  'r--', alpha=0.8)
         plt.title('Predicted vs Actual Values')
         plt.xlabel('Actual Price (JPY/kWh)')
@@ -395,9 +426,9 @@ class JPEXPriceForecastLSTM:
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.plots_dir, 'scatter_plot.png'))
         plt.close()
-        
+
         return errors
-    
+
     def plot_predictions_over_time(self, y_test, predictions):
         """Plot actual vs predicted values over time."""
         plt.figure(figsize=(15, 8))
@@ -410,7 +441,7 @@ class JPEXPriceForecastLSTM:
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.plots_dir, 'predictions_over_time.png'))
         plt.close()
-    
+
     def plot_residuals(self, errors):
         """Plot residuals to analyze prediction errors."""
         plt.figure(figsize=(15, 8))
@@ -422,7 +453,7 @@ class JPEXPriceForecastLSTM:
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.plots_dir, 'residuals_over_time.png'))
         plt.close()
-        
+
         # Residuals Histogram
         plt.figure(figsize=(10, 6))
         sns.histplot(errors, bins=50, kde=True, color='purple')
@@ -432,7 +463,7 @@ class JPEXPriceForecastLSTM:
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.plots_dir, 'residuals_distribution.png'))
         plt.close()
-    
+
     def plot_residuals_acf_pacf(self, errors):
         """Plot ACF and PACF of residuals."""
         from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
@@ -443,24 +474,25 @@ class JPEXPriceForecastLSTM:
         lags = min(requested_lags, max_allowed_lags)
 
         if lags < 1:
-            lags = 1  
+            lags = 1
 
-        print(f"Plotting ACF and PACF with lags={lags} based on sample size={sample_size}")
+        print(
+            f"Plotting ACF and PACF with lags={lags} based on sample size={sample_size}")
 
         plt.figure(figsize=(15, 6))
-        
+
         plt.subplot(1, 2, 1)
         plot_acf(errors, lags=lags, ax=plt.gca())
         plt.title('Residuals Autocorrelation')
-        
+
         plt.subplot(1, 2, 2)
         plot_pacf(errors, lags=lags, ax=plt.gca(), method='ywm')
         plt.title('Residuals Partial Autocorrelation')
-        
+
         plt.tight_layout()
         plt.savefig(os.path.join(self.plots_dir, 'residuals_acf_pacf.png'))
         plt.close()
-    
+
     def visualize_attention_weights(self, X_test):
         """Visualize attention weights."""
         self.model.eval()
@@ -472,7 +504,7 @@ class JPEXPriceForecastLSTM:
             else:
                 print("No attention weights to visualize.")
                 return
-        
+
         avg_attn_weights = attn_weights.mean(axis=0)
         plt.figure(figsize=(12, 6))
         plt.bar(range(len(avg_attn_weights)), avg_attn_weights.squeeze())
@@ -481,14 +513,14 @@ class JPEXPriceForecastLSTM:
         plt.ylabel('Attention Weight')
         plt.savefig(os.path.join(self.plots_dir, 'attention_weights.png'))
         plt.close()
-    
+
     def perform_residuals_diagnostics(self, errors):
         """Perform statistical tests on residuals."""
         shapiro_test = shapiro(errors)
         normal_test_stat, normal_test_p = normaltest(errors)
-        
+
         adf_result = adfuller(errors)
-        
+
         report_content = f"""
     # Residuals Diagnostics Report
 
@@ -505,9 +537,10 @@ class JPEXPriceForecastLSTM:
         - 10%: {adf_result[4]['10%']:.4f}
     """
         # Save report
-        self.generate_report(report_content, report_name='residuals_diagnostics.md')
+        self.generate_report(report_content,
+                             report_name='residuals_diagnostics.md')
         print("Residuals diagnostics report generated.")
-    
+
     def generate_report(self, report_content, report_name='report.md'):
         """Generate markdown report."""
         os.makedirs(self.reports_dir, exist_ok=True)
@@ -515,7 +548,7 @@ class JPEXPriceForecastLSTM:
         with open(report_path, 'w') as f:
             f.write(report_content)
         print(f"Report saved to {report_path}")
-    
+
     def generate_prediction_report(self, X_test, y_test, predictions, metrics):
         """Generate detailed prediction report."""
         report = {
@@ -543,13 +576,17 @@ class JPEXPriceForecastLSTM:
                 'Error Range': np.ptp(y_test - predictions)
             }
         }
-        
+
         # Convert to DataFrame and save
-        report_df = pd.DataFrame({k: v for d in report.values() for k, v in d.items()}, 
+        report_df = pd.DataFrame({k: v for d in report.values() for k, v in d.items()},
                                  index=[0])
         report_df = report_df.round(4)
-        report_df.to_csv(os.path.join(self.reports_dir, 'prediction_report.csv'), index=False)
-        
+        report_df.to_csv(
+            os.path.join(
+                self.reports_dir,
+                'prediction_report.csv'),
+            index=False)
+
         # Generate markdown report
         report_content = f"""
     # Detailed Prediction Report
@@ -576,50 +613,57 @@ class JPEXPriceForecastLSTM:
     - Error Range: {report['Error Analysis']['Error Range']:.4f}
     """
         # Save report
-        self.generate_report(report_content, report_name='prediction_report.md')
-        
+        self.generate_report(
+            report_content,
+            report_name='prediction_report.md')
+
         # Print report summary
         print("\nDetailed Prediction Report:")
         for section, metrics_dict in report.items():
             print(f"\n{section}:")
             for metric, value in metrics_dict.items():
                 print(f"{metric}: {value:.4f}")
-                    
+
         return report
-    
+
     # plot attention weights
     def plot_attention_weights_sample(self, X_sample, y_sample, index=0):
         """Plot attention weights for a specific sample."""
         if not hasattr(self.model, 'attention_weights'):
             print("No attention weights available.")
             return
-        
-        attn_weights = self.model.attention_weights[index].cpu().numpy().squeeze()
+
+        attn_weights = self.model.attention_weights[index].cpu(
+        ).numpy().squeeze()
         time_steps = range(len(attn_weights))
-        
+
         plt.figure(figsize=(12, 6))
         plt.bar(time_steps, attn_weights, color='skyblue')
         plt.title(f'Attention Weights for Sample {index}')
         plt.xlabel('Time Step')
         plt.ylabel('Attention Weight')
         plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, f'attention_weights_sample_{index}.png'))
+        plt.savefig(
+            os.path.join(
+                self.plots_dir,
+                f'attention_weights_sample_{index}.png'))
         plt.close()
-    
+
     def plot_hidden_state_dynamics(self, hidden_states, units=[0, 1, 2]):
         """Plot dynamics of selected hidden units over time."""
         if hidden_states is None:
             print("No hidden states to visualize.")
             return
-        
+
         # hidden_states: (batch_size, seq_length, hidden_size)
         # Compute average over batch for each time step and selected units
-        avg_hidden_states = hidden_states.mean(axis=0)  # (seq_length, hidden_size)
-        
+        avg_hidden_states = hidden_states.mean(
+            axis=0)  # (seq_length, hidden_size)
+
         plt.figure(figsize=(15, 6))
         for unit in units:
             plt.plot(avg_hidden_states[:, unit], label=f'Hidden Unit {unit}')
-        
+
         plt.title('Dynamics of Selected Hidden Units')
         plt.xlabel('Time Step')
         plt.ylabel('Activation')
@@ -627,28 +671,38 @@ class JPEXPriceForecastLSTM:
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.plots_dir, 'hidden_state_dynamics.png'))
         plt.close()
-    
-    def plot_sequence_prediction(self, X_sequence, y_true, y_pred, sequence_length=48, index=0):
+
+    def plot_sequence_prediction(
+            self, X_sequence, y_true, y_pred, sequence_length=48, index=0):
         """Plot input sequence, actual value, and predicted value for a specific sample."""
         plt.figure(figsize=(15, 8))
-        
+
         # Plot input sequence
         system_price_index = self.feature_columns.index('system_price')
-        plt.plot(range(sequence_length), X_sequence[index, :, system_price_index], label='Input Sequence (System Price)', color='gray')
-        
+        plt.plot(range(sequence_length),
+                 X_sequence[index,
+                            :,
+                            system_price_index],
+                 label='Input Sequence (System Price)',
+                 color='gray')
+
         # Plot actual and predicted values
         plt.plot(sequence_length, y_true[index], 'go', label='Actual Price')
         plt.plot(sequence_length, y_pred[index], 'ro', label='Predicted Price')
-        
+
         plt.title(f'Sequence Prediction for Sample {index}')
         plt.xlabel('Time Step')
         plt.ylabel('Price (JPY/kWh)')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, f'sequence_prediction_sample_{index}.png'))
+        plt.savefig(
+            os.path.join(
+                self.plots_dir,
+                f'sequence_prediction_sample_{index}.png'))
         plt.close()
-    
-    def plot_hidden_state_correlation(self, hidden_states, X_test, feature_indices=[0, 1, 2]):
+
+    def plot_hidden_state_correlation(
+            self, hidden_states, X_test, feature_indices=[0, 1, 2]):
         """Plot correlation between hidden states and selected input features."""
         if hidden_states is None:
             print("No hidden states to visualize.")
@@ -657,62 +711,76 @@ class JPEXPriceForecastLSTM:
         # hidden_states: (batch_size, seq_length, hidden_size)
         # X_test: (batch_size, seq_length, num_features)
         # Flatten batch_size and seq_length dimensions
-        hidden_states_flat = hidden_states.reshape(-1, hidden_states.shape[2])  # (batch_size * seq_length, hidden_size)
-        X_test_flat = X_test.reshape(-1, X_test.shape[2])  # (batch_size * seq_length, num_features)
+        # (batch_size * seq_length, hidden_size)
+        hidden_states_flat = hidden_states.reshape(-1, hidden_states.shape[2])
+        # (batch_size * seq_length, num_features)
+        X_test_flat = X_test.reshape(-1, X_test.shape[2])
 
         correlations = {}
         for feature_idx in feature_indices:
             feature_name = self.feature_columns[feature_idx]
             correlations[feature_name] = [
-                np.corrcoef(X_test_flat[:, feature_idx], hidden_states_flat[:, unit])[0, 1] 
+                np.corrcoef(X_test_flat[:, feature_idx],
+                            hidden_states_flat[:, unit])[0, 1]
                 for unit in range(hidden_states_flat.shape[1])
             ]
-        
+
         # Plotting
         plt.figure(figsize=(12, 6))
         for feature, corr in correlations.items():
             plt.plot(range(len(corr)), corr, label=feature)
-        
+
         plt.title('Correlation between Hidden States and Input Features')
         plt.xlabel('Hidden Unit')
         plt.ylabel('Correlation Coefficient')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'hidden_state_correlation.png'))
+        plt.savefig(
+            os.path.join(
+                self.plots_dir,
+                'hidden_state_correlation.png'))
         plt.close()
-    
+
     def plot_hidden_states_pca(self, hidden_states, n_components=2):
         """Perform PCA on hidden states and plot the first two principal components."""
         if hidden_states is None:
             print("No hidden states to visualize.")
             return
-        
+
         # hidden_states: (batch_size, seq_length, hidden_size)
         # Flatten batch_size and seq_length dimensions
-        hidden_states_flat = hidden_states.reshape(-1, hidden_states.shape[2])  # (batch_size * seq_length, hidden_size)
-        
+        # (batch_size * seq_length, hidden_size)
+        hidden_states_flat = hidden_states.reshape(-1, hidden_states.shape[2])
+
         pca = PCA(n_components=n_components)
         principal_components = pca.fit_transform(hidden_states_flat)
-        
+
         plt.figure(figsize=(10, 8))
         if n_components == 2:
-            plt.scatter(principal_components[:, 0], principal_components[:, 1], alpha=0.5)
+            plt.scatter(principal_components[:, 0],
+                        principal_components[:, 1], alpha=0.5)
             plt.xlabel('Principal Component 1')
             plt.ylabel('Principal Component 2')
             plt.title('PCA of Hidden States')
         elif n_components == 3:
             from mpl_toolkits.mplot3d import Axes3D
             ax = plt.axes(projection='3d')
-            ax.scatter(principal_components[:, 0], principal_components[:, 1], principal_components[:, 2], alpha=0.5)
+            ax.scatter(principal_components[:,
+                                            0],
+                       principal_components[:,
+                                            1],
+                       principal_components[:,
+                                            2],
+                       alpha=0.5)
             ax.set_xlabel('PC1')
             ax.set_ylabel('PC2')
             ax.set_zlabel('PC3')
             ax.set_title('3D PCA of Hidden States')
-        
+
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.plots_dir, 'hidden_states_pca.png'))
         plt.close()
-    
+
     def plot_shap_feature_importance(self, X_sample, y_sample):
         """Plot SHAP feature importance for LSTM model."""
         try:
@@ -720,34 +788,42 @@ class JPEXPriceForecastLSTM:
             background = X_sample[:100]
             explainer = shap.GradientExplainer(self.model, background)
             shap_values = explainer.shap_values(X_sample)
-            
+
             # Plot summary
-            shap.summary_plot(shap_values, X_sample, feature_names=self.feature_columns, show=False)
+            shap.summary_plot(
+                shap_values,
+                X_sample,
+                feature_names=self.feature_columns,
+                show=False)
             plt.tight_layout()
             plt.savefig(os.path.join(self.plots_dir, 'shap_summary.png'))
             plt.close()
             print("SHAP summary plot saved.")
         except Exception as e:
             print(f"SHAP analysis failed: {e}")
-    
+
     def perform_shap_analysis(self, X_sample, y_sample):
         """Perform SHAP analysis on the LSTM model."""
         self.plot_shap_feature_importance(X_sample, y_sample)
-    
+
     def plot_residuals_decomposition(self, errors, freq=48):
         """Decompose residuals into trend, seasonal, and residual components."""
-        decomposition = seasonal_decompose(errors, model='additive', period=freq)
-        
+        decomposition = seasonal_decompose(
+            errors, model='additive', period=freq)
+
         plt.figure(figsize=(15, 8))
         decomposition.plot()
         plt.suptitle('Residuals Decomposition', fontsize=16)
-        plt.savefig(os.path.join(self.plots_dir, 'residuals_decomposition.png'))
+        plt.savefig(
+            os.path.join(
+                self.plots_dir,
+                'residuals_decomposition.png'))
         plt.close()
-    
+
     def plot_residuals_dynamics(self, errors):
         """Decompose residuals and plot the components."""
         decomposition = seasonal_decompose(errors, model='additive', period=48)
-        
+
         plt.figure(figsize=(15, 8))
         plt.subplot(411)
         plt.plot(errors, label='Residuals')
@@ -762,18 +838,22 @@ class JPEXPriceForecastLSTM:
         plt.plot(decomposition.resid, label='Residual')
         plt.legend(loc='upper left')
         plt.tight_layout()
-        plt.savefig(os.path.join(self.plots_dir, 'residuals_decomposition_detailed.png'))
+        plt.savefig(
+            os.path.join(
+                self.plots_dir,
+                'residuals_decomposition_detailed.png'))
         plt.close()
-    
+
     def plot_hidden_states_heatmap(self, hidden_states):
         """Plot a heatmap of hidden states."""
         if hidden_states is None:
             print("No hidden states to visualize.")
             return
-        
+
         # hidden_states: (batch_size, seq_length, hidden_size)
         # Compute average over batch and sequence
-        avg_hidden_states = hidden_states.mean(axis=0)  # (seq_length, hidden_size)
+        avg_hidden_states = hidden_states.mean(
+            axis=0)  # (seq_length, hidden_size)
         plt.figure(figsize=(15, 6))
         sns.heatmap(avg_hidden_states.T, cmap='viridis')
         plt.title('Heatmap of Average Hidden States')
@@ -781,26 +861,27 @@ class JPEXPriceForecastLSTM:
         plt.ylabel('Hidden Unit')
         plt.savefig(os.path.join(self.plots_dir, 'hidden_states_heatmap.png'))
         plt.close()
-    
+
     def perform_sensitivity_analysis(self, df, variable, change_percentages):
         """Perform sensitivity analysis on a specific variable."""
         original_values = df[variable].copy()
         results = {}
-        
+
         for pct_change in change_percentages:
             df[variable] = original_values * (1 + pct_change / 100)
             # Recreate features and scale
             df_scaled = self.scaler.transform(df[self.feature_columns])
             # Create sequences
-            X_seq, _ = self.create_sequences(df_scaled, df['system_price'], self.sequence_length)
+            X_seq, _ = self.create_sequences(
+                df_scaled, df['system_price'], self.sequence_length)
             # Predict
             predictions = self.predict(X_seq)
             average_price = predictions.mean()
             results[pct_change] = average_price
-        
+
         # Restore original values
         df[variable] = original_values
-        
+
         # Plotting
         plt.figure(figsize=(10, 6))
         plt.plot(list(results.keys()), list(results.values()), marker='o')
@@ -808,16 +889,25 @@ class JPEXPriceForecastLSTM:
         plt.xlabel('Percentage Change (%)')
         plt.ylabel('Average Predicted Price (JPY/kWh)')
         plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, f'sensitivity_{variable}.png'))
+        plt.savefig(
+            os.path.join(
+                self.plots_dir,
+                f'sensitivity_{variable}.png'))
         plt.close()
-        
+
         # Return results
         return results
-    def generate_future_predictions_report(self, predictions, time_steps, base_datetime='2024-12-07 00:00:00'):
+
+    def generate_future_predictions_report(
+            self, predictions, time_steps, base_datetime='2024-12-07 00:00:00'):
         """Generate a detailed future prediction report and save as CSV and markdown."""
         base_datetime = pd.to_datetime(base_datetime)
-        datetimes = [base_datetime + timedelta(minutes=30 * i) for i in range(time_steps)]
-        
+        datetimes = [
+            base_datetime +
+            timedelta(
+                minutes=30 *
+                i) for i in range(time_steps)]
+
         # Create DataFrame for future predictions
         predictions_df = pd.DataFrame({
             'datetime': datetimes,
@@ -825,11 +915,15 @@ class JPEXPriceForecastLSTM:
             'confidence_lower': predictions * 0.95,
             'confidence_upper': predictions * 1.05
         })
-        
+
         # Save to CSV
-        predictions_df.to_csv(os.path.join(self.reports_dir, 'future_detailed_predictions.csv'), index=False)
+        predictions_df.to_csv(
+            os.path.join(
+                self.reports_dir,
+                'future_detailed_predictions.csv'),
+            index=False)
         print("Future predictions saved to 'future_detailed_predictions.csv'")
-        
+
         # Analyze statistics
         stats = {
             'Overall Statistics': {
@@ -856,7 +950,7 @@ class JPEXPriceForecastLSTM:
                     predictions_df['predicted_price'].idxmin(), 'datetime'].strftime('%H:%M')
             }
         }
-        
+
         # Generate markdown report
         report = f"""
     # Future Electricity Price Forecast Report
@@ -885,7 +979,7 @@ class JPEXPriceForecastLSTM:
     """
         self.generate_report(report, report_name='future_forecast_report.md')
         print("Future forecast report saved to 'future_forecast_report.md'")
-        
+
         return stats, predictions_df
 
 
@@ -893,25 +987,26 @@ def main():
     try:
         # Initialize the forecaster
         forecaster = JPEXPriceForecastLSTM()
-        
+
         print("Loading data...")
         df = forecaster.load_data('spot_summary_2024.csv')
         if df is None:
             return
-        
+
         print("Creating features...")
         df = forecaster.create_features(df)
-        
+
         print("Preparing features...")
         X, y = forecaster.prepare_features(df)
-        
+
         print("Scaling data...")
         X_scaled = forecaster.scale_data(X)
-        
+
         print("Creating sequences...")
         sequence_length = forecaster.sequence_length
-        X_seq, y_seq = forecaster.create_sequences(X_scaled, y, sequence_length)
-        
+        X_seq, y_seq = forecaster.create_sequences(
+            X_scaled, y, sequence_length)
+
         print("Splitting data...")
         # Use the last two days of data as the test set
         test_size = 48 * 2  # 2 days, 48 time periods each day
@@ -919,24 +1014,25 @@ def main():
         y_test = y_seq[-test_size:]
         X_train_val = X_seq[:-test_size]
         y_train_val = y_seq[:-test_size]
-        
+
         # Split the remaining data into training and validation sets
         X_train, X_val, y_train, y_val = train_test_split(
             X_train_val, y_train_val, test_size=0.2, random_state=42
         )
-        
+
         print("Adding attention layer to the model...")
         forecaster.add_attention_layer()
-        
+
         print("Training model...")
         forecaster.train_model(X_train, y_train, X_val, y_val)
-        
+
         print("Plotting training curves...")
         forecaster.plot_training_curves()
-        
+
         print("Making predictions and extracting hidden states...")
-        predictions, hidden_states = forecaster.predict(X_test, return_hidden_states=True)
-        
+        predictions, hidden_states = forecaster.predict(
+            X_test, return_hidden_states=True)
+
         # Evaluate the model
         print("\nEvaluating model performance...")
         metrics = forecaster.evaluate(X_test, y_test)
@@ -945,7 +1041,7 @@ def main():
         print(f"RMSE: {metrics['rmse']:.4f}")
         print(f"MAE: {metrics['mae']:.4f}")
         print(f"R²: {metrics['r2']:.4f}")
-        
+
         # Visualization
         future_time_steps = 48  # Predict for the next 48 time periods
         future_predictions = forecaster.predict(X_test[:future_time_steps])
@@ -953,89 +1049,97 @@ def main():
 
         print("\nGenerating visualizations...")
         errors = forecaster.visualize_predictions(X_test, y_test, predictions)
-        
+
         print("Plotting predictions over time...")
         forecaster.plot_predictions_over_time(y_test, predictions)
-        
+
         print("Plotting residuals...")
         forecaster.plot_residuals(errors)
-        
+
         print("Plotting residuals ACF and PACF...")
         forecaster.plot_residuals_acf_pacf(errors)
-        
+
         print("Performing residuals diagnostics...")
         forecaster.perform_residuals_diagnostics(errors)
-        
+
         print("Visualizing hidden states...")
         forecaster.visualize_hidden_states(hidden_states)
-        
+
         print("Visualizing attention weights...")
         forecaster.visualize_attention_weights(X_test)
-        
+
         print("Plotting attention weights for sample 0...")
         forecaster.plot_attention_weights_sample(X_test, y_test, index=0)
-        
+
         print("Plotting hidden state dynamics...")
         forecaster.plot_hidden_state_dynamics(hidden_states, units=[0, 1, 2])
-        
+
         print("Plotting sequence prediction for sample 0...")
-        forecaster.plot_sequence_prediction(X_test, y_test, predictions, index=0)
-        
+        forecaster.plot_sequence_prediction(
+            X_test, y_test, predictions, index=0)
+
         print("Plotting hidden state correlation...")
         # Select specific features for correlation analysis
         feature_indices = [
-            forecaster.feature_columns.index('system_price'), 
-            forecaster.feature_columns.index('trading_volume'), 
+            forecaster.feature_columns.index('system_price'),
+            forecaster.feature_columns.index('trading_volume'),
             forecaster.feature_columns.index('volume_imbalance')
         ]
-        forecaster.plot_hidden_state_correlation(hidden_states, X_test, feature_indices=feature_indices)
-        
+        forecaster.plot_hidden_state_correlation(
+            hidden_states, X_test, feature_indices=feature_indices)
+
         print("Plotting hidden states PCA...")
         forecaster.plot_hidden_states_pca(hidden_states, n_components=2)
-        
+
         print("Performing SHAP feature importance analysis...")
         # Select a sample of data for SHAP analysis
         shap_sample_size = min(100, X_test.shape[0])
-        forecaster.perform_shap_analysis(X_test[:shap_sample_size], y_test[:shap_sample_size])
-        
+        forecaster.perform_shap_analysis(
+            X_test[:shap_sample_size], y_test[:shap_sample_size])
+
         print("Plotting residuals decomposition...")
         forecaster.plot_residuals_decomposition(errors)
-        
+
         print("Plotting residuals dynamics...")
         forecaster.plot_residuals_dynamics(errors)
-        
+
         print("Plotting hidden states heatmap...")
         forecaster.plot_hidden_states_heatmap(hidden_states)
 
         # Generate detailed report
         print("\nGenerating detailed prediction report...")
-        report = forecaster.generate_prediction_report(X_test, y_test, predictions, metrics)
+        report = forecaster.generate_prediction_report(
+            X_test, y_test, predictions, metrics)
 
         print("Generating future predictions report...")
         future_predictions = forecaster.predict(X_test[:48])
-        stats, predictions_df = forecaster.generate_future_predictions_report(future_predictions, time_steps=48)
+        stats, predictions_df = forecaster.generate_future_predictions_report(
+            future_predictions, time_steps=48)
         print("Future predictions report and CSV generated.")
 
         # performing sensitivity analysis
         print("\nPerforming sensitivity analysis on 'trading_volume'...")
         change_percentages = [-10, -5, 0, 5, 10]
-        sensitivity_results = forecaster.perform_sensitivity_analysis(df, 'trading_volume', change_percentages)
+        sensitivity_results = forecaster.perform_sensitivity_analysis(
+            df, 'trading_volume', change_percentages)
         print("Sensitivity Analysis Results:")
         for pct, avg_price in sensitivity_results.items():
-            print(f"Change: {pct}%, Average Predicted Price: {avg_price:.4f} JPY/kWh")
-        
+            print(
+                f"Change: {pct}%, Average Predicted Price: {avg_price:.4f} JPY/kWh")
+
         print("\nAll results have been saved to the 'outputs_LSTM' directory.")
-        
+
         return {
             'predictions': predictions,
             'metrics': metrics,
             'errors': errors,
             'report': report
         }
-        
+
     except Exception as e:
         print(f"An error occurred: {str(e)}")
         raise
+
 
 if __name__ == "__main__":
     results = main()
