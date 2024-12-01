@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
 import os
 import warnings
 warnings.filterwarnings('ignore')
@@ -14,7 +15,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 # For statistical tests
-from statsmodels.tsa.stattools import coint, adfuller
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from scipy.stats import shapiro, normaltest
+
+# For additional plots
+from statsmodels.tsa.seasonal import seasonal_decompose
+from sklearn.decomposition import PCA
+import shap
 
 class JPEXPriceForecastLSTM:
     def __init__(self, output_dir='outputs_LSTM'):
@@ -24,7 +32,7 @@ class JPEXPriceForecastLSTM:
         self.feature_columns = None
         self.output_dir = output_dir
         self.create_output_directories()
-        self.sequence_length = 48  # 使用过去 24 小时的数据（48 个时间步长）进行预测
+        self.sequence_length = 48 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.training_losses = []
         self.validation_losses = []
@@ -41,12 +49,9 @@ class JPEXPriceForecastLSTM:
         # Read data
         df = pd.read_csv(file_path, encoding='shift-jis')
         
-        # 打印原始 DataFrame 的列名以进行调试
-        print("Columns in the original DataFrame:", df.columns.tolist())
-        
-        # 更新列名映射
         columns = {
             '日付': 'date',
+            '受渡日': 'date',  
             '時刻コード': 'time_code',
             '売り入札量(kWh)': 'sell_volume',
             '買い入札量(kWh)': 'buy_volume',
@@ -55,15 +60,9 @@ class JPEXPriceForecastLSTM:
         }
         df = df.rename(columns=columns)
         
-        # 检查是否存在 'date' 列
-        if 'date' not in df.columns:
-            # 如果没有，可以手动添加或抛出错误
-            df['date'] = '2024-01-01'  # 替换为实际日期
-            df['date'] = pd.to_datetime(df['date'])
-            print("Added 'date' column manually.")
-        else:
-            df['date'] = pd.to_datetime(df['date'])
-            print("Converted 'date' column to datetime.")
+        df['date'] = '2024-01-01' 
+        df['date'] = pd.to_datetime(df['date'])
+        print("Added 'date' column manually.")
         
         # Create time features
         df['hour'] = (df['time_code'] - 1) // 2
@@ -95,10 +94,6 @@ class JPEXPriceForecastLSTM:
             # Volume statistics
             df[f'volume_ma_{window}'] = df['trading_volume'].rolling(window=window).mean()
         
-        # Historical statistics for each time block
-        df['price_time_block_mean'] = df.groupby('time_code')['system_price'].transform('mean')
-        df['price_time_block_std'] = df.groupby('time_code')['system_price'].transform('std')
-        
         # Remove rows with NaN values
         df = df.dropna()
         
@@ -107,10 +102,9 @@ class JPEXPriceForecastLSTM:
     def prepare_features(self, df):
         """Prepare model input features."""
         features = [
-            'system_price',  # LSTM 输入需要包含目标变量
+            'system_price',
             'hour', 'minute', 'time_code',
             'trading_volume', 'volume_imbalance', 'volume_ratio',
-            'price_time_block_mean', 'price_time_block_std'
         ]
         
         # Add created features
@@ -148,15 +142,17 @@ class JPEXPriceForecastLSTM:
             
         def forward(self, x):
             out, hidden = self.lstm(x)
-            self.hidden_states = out  # 保存所有时间步的隐藏状态
+            self.hidden_states = out  # Save hidden states for visualization
             out = out[:, -1, :]  # Get the last time step output
             out = self.fc(out)
             return out.squeeze()
     
     def train_model(self, X_train, y_train, X_val=None, y_val=None):
         """Train LSTM model."""
+        # Initialize the model
         input_size = X_train.shape[2]
         self.model = self.LSTMModel(input_size).to(self.device)
+        
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
         
@@ -176,22 +172,36 @@ class JPEXPriceForecastLSTM:
         best_val_loss = np.inf
         patience = 10
         patience_counter = 0
+        gradient_norms = []
         
         for epoch in range(num_epochs):
             self.model.train()
             train_losses = []
+            epoch_grad_norm = []
             for X_batch, y_batch in train_loader:
                 optimizer.zero_grad()
                 outputs = self.model(X_batch)
                 loss = criterion(outputs, y_batch)
                 loss.backward()
-                # 梯度剪裁，防止梯度爆炸
+                # clip gradients
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5)
+                
+                # calculate gradient norm
+                total_norm = 0.0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+                epoch_grad_norm.append(total_norm)
+                
                 optimizer.step()
                 train_losses.append(loss.item())
             
             avg_train_loss = np.mean(train_losses)
+            avg_grad_norm = np.mean(epoch_grad_norm)
             self.training_losses.append(avg_train_loss)
+            gradient_norms.append(avg_grad_norm)
             
             if X_val is not None and y_val is not None:
                 self.model.eval()
@@ -199,7 +209,7 @@ class JPEXPriceForecastLSTM:
                     val_outputs = self.model(X_val)
                     val_loss = criterion(val_outputs, y_val).item()
                 self.validation_losses.append(val_loss)
-                print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}")
+                print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}, Avg Grad Norm: {avg_grad_norm:.4f}")
                 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -211,11 +221,21 @@ class JPEXPriceForecastLSTM:
                         print("Early stopping")
                         break
             else:
-                print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.6f}")
+                print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.6f}, Avg Grad Norm: {avg_grad_norm:.4f}")
         
         # Load the best model
         if X_val is not None and y_val is not None:
             self.model.load_state_dict(torch.load(os.path.join(self.output_dir, 'best_model.pth')))
+        
+        # Plot gradient norms
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, len(gradient_norms)+1), gradient_norms, marker='o')
+        plt.title('Average Gradient Norm per Epoch')
+        plt.xlabel('Epoch')
+        plt.ylabel('Gradient Norm')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.plots_dir, 'gradient_norms.png'))
+        plt.close()
     
     def predict(self, X, return_hidden_states=False):
         """Generate predictions."""
@@ -226,9 +246,11 @@ class JPEXPriceForecastLSTM:
         X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
         with torch.no_grad():
             predictions = self.model(X_tensor).cpu().numpy()
-            if return_hidden_states:
+            if return_hidden_states and hasattr(self.model, 'hidden_states'):
                 hidden_states = self.model.hidden_states.cpu().numpy()
                 return predictions.flatten(), hidden_states
+        if return_hidden_states:
+            return predictions.flatten(), None
         return predictions.flatten()
     
     def evaluate(self, X_test, y_test):
@@ -264,7 +286,10 @@ class JPEXPriceForecastLSTM:
     
     def visualize_hidden_states(self, hidden_states):
         """Visualize hidden states over time."""
-        # 取平均值或者其他方式处理隐藏状态
+        if hidden_states is None:
+            print("No hidden states to visualize.")
+            return
+        # get the average hidden states over the batch
         avg_hidden_states = hidden_states.mean(axis=2)
         plt.figure(figsize=(15, 6))
         plt.imshow(avg_hidden_states.T, aspect='auto', cmap='viridis')
@@ -275,41 +300,9 @@ class JPEXPriceForecastLSTM:
         plt.savefig(os.path.join(self.plots_dir, 'hidden_states.png'))
         plt.close()
     
-    def analyze_time_step_importance(self, X_test, y_test):
-        """Analyze the importance of different time steps."""
-        # 遍历时间步长，评估每个时间步长的重要性
-        sequence_length = X_test.shape[1]
-        importances = []
-        base_predictions = self.predict(X_test)
-        for t in range(sequence_length):
-            X_modified = X_test.copy()
-            X_modified[:, t, :] = 0  # 将第 t 个时间步的输入置零
-            modified_predictions = self.predict(X_modified)
-            importance = mean_squared_error(base_predictions, modified_predictions)
-            importances.append(importance)
-        
-        # 可视化时间步长的重要性
-        plt.figure(figsize=(12, 6))
-        plt.bar(range(sequence_length), importances)
-        plt.title('Time Step Importance')
-        plt.xlabel('Time Step')
-        plt.ylabel('MSE Increase')
-        plt.savefig(os.path.join(self.plots_dir, 'time_step_importance.png'))
-        plt.close()
-    
-    def detect_gradient_flow(self):
-        """Detect gradient flow to check for vanishing or exploding gradients."""
-        total_norm = 0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** 0.5
-        print(f"Total Gradient Norm: {total_norm}")
-    
     def add_attention_layer(self):
         """Add an attention mechanism to the LSTM model."""
-        # 注意力机制需要修改模型结构
+        # Attention layer
         class LSTMAttentionModel(nn.Module):
             def __init__(self, input_size, hidden_size=128, num_layers=2):
                 super().__init__()
@@ -319,27 +312,153 @@ class JPEXPriceForecastLSTM:
                 
             def forward(self, x):
                 lstm_out, _ = self.lstm(x)
-                # 计算注意力权重
+                # calculate attention weights
                 attn_weights = torch.softmax(self.attention(lstm_out), dim=1)
-                # 加权求和
+                # calculate context vector
                 context = torch.sum(attn_weights * lstm_out, dim=1)
                 out = self.fc(context)
                 self.attention_weights = attn_weights
                 return out.squeeze()
         
-        # 用新的模型替换旧模型
-        input_size = self.feature_columns.__len__()
+        # Initialize the model with attention
+        input_size = len(self.feature_columns)
         self.model = LSTMAttentionModel(input_size).to(self.device)
         print("Attention layer added to the model.")
     
+    def visualize_predictions(self, X_test, y_test, predictions):
+        """Create visualizations for predictions and errors."""
+        # Create plots directory if it doesn't exist
+        os.makedirs(self.plots_dir, exist_ok=True)
+        
+        # 1. Predictions vs Actual Values
+        plt.figure(figsize=(15, 8))
+        plt.plot(y_test, label='Actual', color='blue', alpha=0.7)
+        plt.plot(predictions, label='Predicted', color='red', alpha=0.7)
+        
+        # Add 95% confidence interval
+        std_dev = np.std(y_test - predictions)
+        plt.fill_between(range(len(predictions)),
+                         predictions - 1.96*std_dev,
+                         predictions + 1.96*std_dev,
+                         alpha=0.2, color='red',
+                         label='95% Confidence Interval')
+        
+        plt.title('Electricity Price Prediction vs Actual Values')
+        plt.xlabel('Time Period')
+        plt.ylabel('Price (JPY/kWh)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.plots_dir, 'prediction_with_ci.png'))
+        plt.close()
+        
+        # 2. Prediction Error Analysis
+        errors = y_test - predictions
+        plt.figure(figsize=(15, 8))
+        plt.subplot(2, 1, 1)
+        plt.plot(errors, color='red', alpha=0.7)
+        plt.title('Prediction Errors Over Time')
+        plt.xlabel('Time Period')
+        plt.ylabel('Error (JPY/kWh)')
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(2, 1, 2)
+        sns.histplot(errors, bins=50, kde=True)
+        plt.title('Error Distribution')
+        plt.xlabel('Error (JPY/kWh)')
+        plt.ylabel('Frequency')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'error_analysis.png'))
+        plt.close()
+        
+        # 3. Predicted vs Actual Scatter Plot
+        plt.figure(figsize=(10, 10))
+        plt.scatter(y_test, predictions, alpha=0.5)
+        plt.plot([y_test.min(), y_test.max()], 
+                 [y_test.min(), y_test.max()], 
+                 'r--', alpha=0.8)
+        plt.title('Predicted vs Actual Values')
+        plt.xlabel('Actual Price (JPY/kWh)')
+        plt.ylabel('Predicted Price (JPY/kWh)')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.plots_dir, 'scatter_plot.png'))
+        plt.close()
+        
+        return errors
+    
+    def plot_predictions_over_time(self, y_test, predictions):
+        """Plot actual vs predicted values over time."""
+        plt.figure(figsize=(15, 8))
+        plt.plot(y_test, label='Actual', color='blue')
+        plt.plot(predictions, label='Predicted', color='red', alpha=0.7)
+        plt.title('Actual vs Predicted Prices Over Time')
+        plt.xlabel('Time Period')
+        plt.ylabel('Price (JPY/kWh)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.plots_dir, 'predictions_over_time.png'))
+        plt.close()
+    
+    def plot_residuals(self, errors):
+        """Plot residuals to analyze prediction errors."""
+        plt.figure(figsize=(15, 8))
+        plt.plot(errors, label='Residuals', color='purple')
+        plt.title('Residuals Over Time')
+        plt.xlabel('Time Period')
+        plt.ylabel('Residual (JPY/kWh)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.plots_dir, 'residuals_over_time.png'))
+        plt.close()
+        
+        # Residuals Histogram
+        plt.figure(figsize=(10, 6))
+        sns.histplot(errors, bins=50, kde=True, color='purple')
+        plt.title('Residuals Distribution')
+        plt.xlabel('Residual (JPY/kWh)')
+        plt.ylabel('Frequency')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.plots_dir, 'residuals_distribution.png'))
+        plt.close()
+    
+    def plot_residuals_acf_pacf(self, errors):
+        """Plot ACF and PACF of residuals."""
+        from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+
+        sample_size = len(errors)
+        max_allowed_lags = int(sample_size * 0.5) - 1
+        requested_lags = 50
+        lags = min(requested_lags, max_allowed_lags)
+
+        if lags < 1:
+            lags = 1  
+
+        print(f"Plotting ACF and PACF with lags={lags} based on sample size={sample_size}")
+
+        plt.figure(figsize=(15, 6))
+        
+        plt.subplot(1, 2, 1)
+        plot_acf(errors, lags=lags, ax=plt.gca())
+        plt.title('Residuals Autocorrelation')
+        
+        plt.subplot(1, 2, 2)
+        plot_pacf(errors, lags=lags, ax=plt.gca(), method='ywm')
+        plt.title('Residuals Partial Autocorrelation')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'residuals_acf_pacf.png'))
+        plt.close()
+    
     def visualize_attention_weights(self, X_test):
         """Visualize attention weights."""
-        # 获取注意力权重
         self.model.eval()
         X_tensor = torch.tensor(X_test, dtype=torch.float32).to(self.device)
         with torch.no_grad():
             _ = self.model(X_tensor)
-            attn_weights = self.model.attention_weights.cpu().numpy()
+            if hasattr(self.model, 'attention_weights'):
+                attn_weights = self.model.attention_weights.cpu().numpy()
+            else:
+                print("No attention weights to visualize.")
+                return
         
         avg_attn_weights = attn_weights.mean(axis=0)
         plt.figure(figsize=(12, 6))
@@ -349,6 +468,32 @@ class JPEXPriceForecastLSTM:
         plt.ylabel('Attention Weight')
         plt.savefig(os.path.join(self.plots_dir, 'attention_weights.png'))
         plt.close()
+    
+    def perform_residuals_diagnostics(self, errors):
+        """Perform statistical tests on residuals."""
+        shapiro_test = shapiro(errors)
+        normal_test_stat, normal_test_p = normaltest(errors)
+        
+        adf_result = adfuller(errors)
+        
+        report_content = f"""
+    # Residuals Diagnostics Report
+
+    ## Normality Tests
+    - Shapiro-Wilk Test Statistic: {shapiro_test.statistic:.4f}, p-value: {shapiro_test.pvalue:.4f}
+    - D'Agostino's K-squared Test Statistic: {normal_test_stat:.4f}, p-value: {normal_test_p:.4f}
+
+    ## Stationarity Test
+    - Augmented Dickey-Fuller Test Statistic: {adf_result[0]:.4f}
+    - p-value: {adf_result[1]:.4f}
+    - Critical Values:
+        - 1%: {adf_result[4]['1%']:.4f}
+        - 5%: {adf_result[4]['5%']:.4f}
+        - 10%: {adf_result[4]['10%']:.4f}
+    """
+        # Save report
+        self.generate_report(report_content, report_name='residuals_diagnostics.md')
+        print("Residuals diagnostics report generated.")
     
     def generate_report(self, report_content, report_name='report.md'):
         """Generate markdown report."""
@@ -394,194 +539,234 @@ class JPEXPriceForecastLSTM:
         
         # Generate markdown report
         report_content = f"""
-# Detailed Prediction Report
+    # Detailed Prediction Report
 
-## Overall Metrics
-- Mean Squared Error: {metrics['mse']:.4f}
-- Root Mean Squared Error: {metrics['rmse']:.4f}
-- Mean Absolute Error: {metrics['mae']:.4f}
-- R² Score: {metrics['r2']:.4f}
+    ## Overall Metrics
+    - Mean Squared Error: {metrics['mse']:.4f}
+    - Root Mean Squared Error: {metrics['rmse']:.4f}
+    - Mean Absolute Error: {metrics['mae']:.4f}
+    - R² Score: {metrics['r2']:.4f}
 
-## Price Statistics
-- Actual Mean: {report['Price Statistics']['Actual Mean']:.4f}
-- Actual Std: {report['Price Statistics']['Actual Std']:.4f}
-- Actual Min: {report['Price Statistics']['Actual Min']:.4f}
-- Actual Max: {report['Price Statistics']['Actual Max']:.4f}
-- Predicted Min: {report['Price Statistics']['Predicted Min']:.4f}
-- Predicted Max: {report['Price Statistics']['Predicted Max']:.4f}
+    ## Price Statistics
+    - Actual Mean: {report['Price Statistics']['Actual Mean']:.4f}
+    - Actual Std: {report['Price Statistics']['Actual Std']:.4f}
+    - Actual Min: {report['Price Statistics']['Actual Min']:.4f}
+    - Actual Max: {report['Price Statistics']['Actual Max']:.4f}
+    - Predicted Min: {report['Price Statistics']['Predicted Min']:.4f}
+    - Predicted Max: {report['Price Statistics']['Predicted Max']:.4f}
 
-## Error Analysis
-- Mean Error: {report['Error Analysis']['Mean Error']:.4f}
-- Error Std: {report['Error Analysis']['Error Std']:.4f}
-- Max Underestimation: {report['Error Analysis']['Max Underestimation']:.4f}
-- Max Overestimation: {report['Error Analysis']['Max Overestimation']:.4f}
-- Error Range: {report['Error Analysis']['Error Range']:.4f}
-"""
+    ## Error Analysis
+    - Mean Error: {report['Error Analysis']['Mean Error']:.4f}
+    - Error Std: {report['Error Analysis']['Error Std']:.4f}
+    - Max Underestimation: {report['Error Analysis']['Max Underestimation']:.4f}
+    - Max Overestimation: {report['Error Analysis']['Max Overestimation']:.4f}
+    - Error Range: {report['Error Analysis']['Error Range']:.4f}
+    """
         # Save report
         self.generate_report(report_content, report_name='prediction_report.md')
         
         # Print report summary
         print("\nDetailed Prediction Report:")
-        for section, metrics in report.items():
+        for section, metrics_dict in report.items():
             print(f"\n{section}:")
-            for metric, value in metrics.items():
+            for metric, value in metrics_dict.items():
                 print(f"{metric}: {value:.4f}")
-                
+                    
         return report
     
-    # 添加经济学分析方法，从您的 XGBoost 代码中复制
-    def plot_supply_demand_curves(self, df, time_period=None):
-        """Plot supply and demand curves for a specific time period."""
-        # If time_period is None, use the last available period
-        if time_period is None:
-            time_period = df['datetime'].iloc[-1]
-        else:
-            time_period = pd.to_datetime(time_period)
-        
-        # Filter data for the specified time period
-        df_period = df[df['datetime'] == time_period]
-        
-        if df_period.empty:
-            print(f"No data available for {time_period}")
+    # plot attention weights
+    def plot_attention_weights_sample(self, X_sample, y_sample, index=0):
+        """Plot attention weights for a specific sample."""
+        if not hasattr(self.model, 'attention_weights'):
+            print("No attention weights available.")
             return
         
-        # Assuming 'system_price', 'sell_volume', and 'buy_volume' are available
-        price_points = df_period['system_price'].unique()
-        sell_volumes = df_period.groupby('system_price')['sell_volume'].sum().sort_index()
-        buy_volumes = df_period.groupby('system_price')['buy_volume'].sum().sort_index(ascending=False)
+        attn_weights = self.model.attention_weights[index].cpu().numpy().squeeze()
+        time_steps = range(len(attn_weights))
         
-        cumulative_supply = sell_volumes.cumsum()
-        cumulative_demand = buy_volumes.cumsum()
+        plt.figure(figsize=(12, 6))
+        plt.bar(time_steps, attn_weights, color='skyblue')
+        plt.title(f'Attention Weights for Sample {index}')
+        plt.xlabel('Time Step')
+        plt.ylabel('Attention Weight')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.plots_dir, f'attention_weights_sample_{index}.png'))
+        plt.close()
+    
+    def plot_hidden_state_dynamics(self, hidden_states, units=[0, 1, 2]):
+        """Plot dynamics of selected hidden units over time."""
+        if hidden_states is None:
+            print("No hidden states to visualize.")
+            return
+        
+        # hidden_states: (batch_size, seq_length, hidden_size)
+        # Compute average over batch for each time step and selected units
+        avg_hidden_states = hidden_states.mean(axis=0)  # (seq_length, hidden_size)
+        
+        plt.figure(figsize=(15, 6))
+        for unit in units:
+            plt.plot(avg_hidden_states[:, unit], label=f'Hidden Unit {unit}')
+        
+        plt.title('Dynamics of Selected Hidden Units')
+        plt.xlabel('Time Step')
+        plt.ylabel('Activation')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.plots_dir, 'hidden_state_dynamics.png'))
+        plt.close()
+    
+    def plot_sequence_prediction(self, X_sequence, y_true, y_pred, sequence_length=48, index=0):
+        """Plot input sequence, actual value, and predicted value for a specific sample."""
+        plt.figure(figsize=(15, 8))
+        
+        # Plot input sequence
+        system_price_index = self.feature_columns.index('system_price')
+        plt.plot(range(sequence_length), X_sequence[index, :, system_price_index], label='Input Sequence (System Price)', color='gray')
+        
+        # Plot actual and predicted values
+        plt.plot(sequence_length, y_true[index], 'go', label='Actual Price')
+        plt.plot(sequence_length, y_pred[index], 'ro', label='Predicted Price')
+        
+        plt.title(f'Sequence Prediction for Sample {index}')
+        plt.xlabel('Time Step')
+        plt.ylabel('Price (JPY/kWh)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.plots_dir, f'sequence_prediction_sample_{index}.png'))
+        plt.close()
+    
+    def plot_hidden_state_correlation(self, hidden_states, X_test, feature_indices=[0, 1, 2]):
+        """Plot correlation between hidden states and selected input features."""
+        if hidden_states is None:
+            print("No hidden states to visualize.")
+            return
+
+        # hidden_states: (batch_size, seq_length, hidden_size)
+        # X_test: (batch_size, seq_length, num_features)
+        # Flatten batch_size and seq_length dimensions
+        hidden_states_flat = hidden_states.reshape(-1, hidden_states.shape[2])  # (batch_size * seq_length, hidden_size)
+        X_test_flat = X_test.reshape(-1, X_test.shape[2])  # (batch_size * seq_length, num_features)
+
+        correlations = {}
+        for feature_idx in feature_indices:
+            feature_name = self.feature_columns[feature_idx]
+            correlations[feature_name] = [
+                np.corrcoef(X_test_flat[:, feature_idx], hidden_states_flat[:, unit])[0, 1] 
+                for unit in range(hidden_states_flat.shape[1])
+            ]
         
         # Plotting
-        plt.figure(figsize=(10, 6))
-        plt.plot(cumulative_supply, sell_volumes.index, label='Supply Curve', drawstyle='steps-post')
-        plt.plot(cumulative_demand, buy_volumes.index, label='Demand Curve', drawstyle='steps-post')
+        plt.figure(figsize=(12, 6))
+        for feature, corr in correlations.items():
+            plt.plot(range(len(corr)), corr, label=feature)
         
-        # Equilibrium point (approximate)
-        equilibrium_price = df_period['system_price'].iloc[0]
-        equilibrium_quantity = cumulative_supply.iloc[0]
-        
-        plt.axhline(equilibrium_price, color='gray', linestyle='--', alpha=0.7)
-        plt.axvline(equilibrium_quantity, color='gray', linestyle='--', alpha=0.7)
-        
-        plt.title(f'Supply and Demand Curves on {time_period}')
-        plt.xlabel('Cumulative Quantity (kWh)')
-        plt.ylabel('Price (JPY/kWh)')
+        plt.title('Correlation between Hidden States and Input Features')
+        plt.xlabel('Hidden Unit')
+        plt.ylabel('Correlation Coefficient')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, f'supply_demand_{time_period}.png'))
+        plt.savefig(os.path.join(self.plots_dir, 'hidden_state_correlation.png'))
         plt.close()
     
-    def calculate_price_elasticity(self, df):
-        """Calculate and plot price elasticity of demand."""
-        # Calculate percentage changes
-        df['pct_change_price'] = df['system_price'].pct_change()
-        df['pct_change_demand'] = df['buy_volume'].pct_change()
+    def plot_hidden_states_pca(self, hidden_states, n_components=2):
+        """Perform PCA on hidden states and plot the first two principal components."""
+        if hidden_states is None:
+            print("No hidden states to visualize.")
+            return
         
-        # Avoid division by zero
-        df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=['pct_change_price', 'pct_change_demand'])
+        # hidden_states: (batch_size, seq_length, hidden_size)
+        # Flatten batch_size and seq_length dimensions
+        hidden_states_flat = hidden_states.reshape(-1, hidden_states.shape[2])  # (batch_size * seq_length, hidden_size)
         
-        # Calculate elasticity
-        df['elasticity'] = df['pct_change_demand'] / df['pct_change_price']
+        pca = PCA(n_components=n_components)
+        principal_components = pca.fit_transform(hidden_states_flat)
         
-        # Plot elasticity over time
+        plt.figure(figsize=(10, 8))
+        if n_components == 2:
+            plt.scatter(principal_components[:, 0], principal_components[:, 1], alpha=0.5)
+            plt.xlabel('Principal Component 1')
+            plt.ylabel('Principal Component 2')
+            plt.title('PCA of Hidden States')
+        elif n_components == 3:
+            from mpl_toolkits.mplot3d import Axes3D
+            ax = plt.axes(projection='3d')
+            ax.scatter(principal_components[:, 0], principal_components[:, 1], principal_components[:, 2], alpha=0.5)
+            ax.set_xlabel('PC1')
+            ax.set_ylabel('PC2')
+            ax.set_zlabel('PC3')
+            ax.set_title('3D PCA of Hidden States')
+        
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.plots_dir, 'hidden_states_pca.png'))
+        plt.close()
+    
+    def plot_shap_feature_importance(self, X_sample, y_sample):
+        """Plot SHAP feature importance for LSTM model."""
+        try:
+            # Select a subset of data for SHAP
+            background = X_sample[:100]
+            explainer = shap.GradientExplainer(self.model, background)
+            shap_values = explainer.shap_values(X_sample)
+            
+            # Plot summary
+            shap.summary_plot(shap_values, X_sample, feature_names=self.feature_columns, show=False)
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.plots_dir, 'shap_summary.png'))
+            plt.close()
+            print("SHAP summary plot saved.")
+        except Exception as e:
+            print(f"SHAP analysis failed: {e}")
+    
+    def perform_shap_analysis(self, X_sample, y_sample):
+        """Perform SHAP analysis on the LSTM model."""
+        self.plot_shap_feature_importance(X_sample, y_sample)
+    
+    def plot_residuals_decomposition(self, errors, freq=48):
+        """Decompose residuals into trend, seasonal, and residual components."""
+        decomposition = seasonal_decompose(errors, model='additive', period=freq)
+        
         plt.figure(figsize=(15, 8))
-        plt.plot(df['datetime'], df['elasticity'], label='Price Elasticity of Demand')
-        plt.title('Price Elasticity of Demand Over Time')
-        plt.xlabel('Time')
-        plt.ylabel('Elasticity')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'price_elasticity.png'))
+        decomposition.plot()
+        plt.suptitle('Residuals Decomposition', fontsize=16)
+        plt.savefig(os.path.join(self.plots_dir, 'residuals_decomposition.png'))
         plt.close()
-        
-        # Return elasticity DataFrame
-        return df[['datetime', 'elasticity']]
     
-    def analyze_price_volatility(self, df):
-        """Analyze and plot price volatility."""
-        # Calculate rolling standard deviation
-        df['price_volatility'] = df['system_price'].rolling(window=48).std()
+    def plot_residuals_dynamics(self, errors):
+        """Decompose residuals and plot the components."""
+        decomposition = seasonal_decompose(errors, model='additive', period=48)
         
-        # Plot volatility over time
         plt.figure(figsize=(15, 8))
-        plt.plot(df['datetime'], df['price_volatility'], label='Price Volatility')
-        plt.title('Electricity Price Volatility Over Time')
-        plt.xlabel('Time')
-        plt.ylabel('Volatility (Standard Deviation)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'price_volatility.png'))
+        plt.subplot(411)
+        plt.plot(errors, label='Residuals')
+        plt.legend(loc='upper left')
+        plt.subplot(412)
+        plt.plot(decomposition.trend, label='Trend')
+        plt.legend(loc='upper left')
+        plt.subplot(413)
+        plt.plot(decomposition.seasonal, label='Seasonal')
+        plt.legend(loc='upper left')
+        plt.subplot(414)
+        plt.plot(decomposition.resid, label='Residual')
+        plt.legend(loc='upper left')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'residuals_decomposition_detailed.png'))
         plt.close()
-        
-        # Return volatility DataFrame
-        return df[['datetime', 'price_volatility']]
     
-    def analyze_seasonal_patterns(self, df):
-        """Analyze and plot seasonal patterns."""
-        # Extract date components
-        df['month'] = df['datetime'].dt.month
-        df['weekday'] = df['datetime'].dt.weekday
-        df['is_weekend'] = df['weekday'] >= 5
+    def plot_hidden_states_heatmap(self, hidden_states):
+        """Plot a heatmap of hidden states."""
+        if hidden_states is None:
+            print("No hidden states to visualize.")
+            return
         
-        # Monthly average prices
-        monthly_prices = df.groupby('month')['system_price'].mean()
-        
-        # Plot monthly average prices
-        plt.figure(figsize=(10, 6))
-        monthly_prices.plot(kind='bar')
-        plt.title('Average Electricity Price by Month')
-        plt.xlabel('Month')
-        plt.ylabel('Price (JPY/kWh)')
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'monthly_average_prices.png'))
-        plt.close()
-        
-        # Weekday vs Weekend prices
-        plt.figure(figsize=(8, 6))
-        sns.boxplot(x='is_weekend', y='system_price', data=df)
-        plt.title('Electricity Price: Weekday vs Weekend')
-        plt.xlabel('Is Weekend')
-        plt.ylabel('Price (JPY/kWh)')
-        plt.savefig(os.path.join(self.plots_dir, 'weekday_weekend_prices.png'))
-        plt.close()
-        
-        # Return DataFrame with seasonal features
-        return df
-    
-    def analyze_profit_margins(self, df, marginal_cost):
-        """Analyze profit margins given a marginal cost."""
-        df['profit_margin'] = df['system_price'] - marginal_cost
-        
-        # Plot profit margins over time
-        plt.figure(figsize=(15, 8))
-        plt.plot(df['datetime'], df['profit_margin'], label='Profit Margin')
-        plt.title('Profit Margins Over Time')
-        plt.xlabel('Time')
-        plt.ylabel('Profit Margin (JPY/kWh)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'profit_margins.png'))
-        plt.close()
-        
-        # Return DataFrame with profit margins
-        return df
-    
-    def plot_load_duration_curve(self, df):
-        """Plot the load duration curve."""
-        # Sort demand data
-        sorted_demand = df['buy_volume'].sort_values(ascending=False).reset_index(drop=True)
-        time_percentile = np.linspace(0, 100, len(sorted_demand))
-        
-        # Plotting
-        plt.figure(figsize=(10, 6))
-        plt.plot(time_percentile, sorted_demand)
-        plt.title('Load Duration Curve')
-        plt.xlabel('Time Percentile (%)')
-        plt.ylabel('Demand (kWh)')
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'load_duration_curve.png'))
+        # hidden_states: (batch_size, seq_length, hidden_size)
+        # Compute average over batch and sequence
+        avg_hidden_states = hidden_states.mean(axis=0)  # (seq_length, hidden_size)
+        plt.figure(figsize=(15, 6))
+        sns.heatmap(avg_hidden_states.T, cmap='viridis')
+        plt.title('Heatmap of Average Hidden States')
+        plt.xlabel('Time Step')
+        plt.ylabel('Hidden Unit')
+        plt.savefig(os.path.join(self.plots_dir, 'hidden_states_heatmap.png'))
         plt.close()
     
     def perform_sensitivity_analysis(self, df, variable, change_percentages):
@@ -591,11 +776,12 @@ class JPEXPriceForecastLSTM:
         
         for pct_change in change_percentages:
             df[variable] = original_values * (1 + pct_change / 100)
-            # 需要重新处理特征并进行预测
-            X_modified, _ = self.prepare_features(df)
-            X_scaled_modified = self.scaler.transform(X_modified)
-            X_seq_modified, _ = self.create_sequences(X_scaled_modified, df['system_price'], self.sequence_length)
-            predictions = self.predict(X_seq_modified)
+            # Recreate features and scale
+            df_scaled = self.scaler.transform(df[self.feature_columns])
+            # Create sequences
+            X_seq, _ = self.create_sequences(df_scaled, df['system_price'], self.sequence_length)
+            # Predict
+            predictions = self.predict(X_seq)
             average_price = predictions.mean()
             results[pct_change] = average_price
         
@@ -614,29 +800,7 @@ class JPEXPriceForecastLSTM:
         
         # Return results
         return results
-    
-    def forecast_demand(self, df):
-        """Forecast future electricity demand."""
-        # Use historical demand data
-        demand_series = df['buy_volume']
-        
-        # Simple Moving Average Forecast as an example
-        df['demand_forecast'] = demand_series.rolling(window=48).mean().shift(1)
-        
-        # Plot forecast vs actual
-        plt.figure(figsize=(15, 8))
-        plt.plot(df['datetime'], df['buy_volume'], label='Actual Demand')
-        plt.plot(df['datetime'], df['demand_forecast'], label='Forecasted Demand', alpha=0.7)
-        plt.title('Electricity Demand Forecast')
-        plt.xlabel('Time')
-        plt.ylabel('Demand (kWh)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'demand_forecast.png'))
-        plt.close()
-        
-        # Return DataFrame with forecast
-        return df
+
 
 def main():
     try:
@@ -645,6 +809,8 @@ def main():
         
         print("Loading data...")
         df = forecaster.load_data('spot_summary_2024.csv')
+        if df is None:
+            return
         
         print("Creating features...")
         df = forecaster.create_features(df)
@@ -695,7 +861,19 @@ def main():
         
         # Visualizations
         print("\nGenerating visualizations...")
-        hourly_metrics = forecaster.visualize_predictions(X_test, y_test, predictions)
+        errors = forecaster.visualize_predictions(X_test, y_test, predictions)
+        
+        print("Plotting predictions over time...")
+        forecaster.plot_predictions_over_time(y_test, predictions)
+        
+        print("Plotting residuals...")
+        forecaster.plot_residuals(errors)
+        
+        print("Plotting residuals ACF and PACF...")
+        forecaster.plot_residuals_acf_pacf(errors)
+        
+        print("Performing residuals diagnostics...")
+        forecaster.perform_residuals_diagnostics(errors)
         
         print("Visualizing hidden states...")
         forecaster.visualize_hidden_states(hidden_states)
@@ -703,51 +881,61 @@ def main():
         print("Visualizing attention weights...")
         forecaster.visualize_attention_weights(X_test)
         
-        print("Analyzing time step importance...")
-        forecaster.analyze_time_step_importance(X_test, y_test)
+        # 新增可视化方法调用开始
+        print("Plotting attention weights for sample 0...")
+        forecaster.plot_attention_weights_sample(X_test, y_test, index=0)
         
+        print("Plotting hidden state dynamics...")
+        forecaster.plot_hidden_state_dynamics(hidden_states, units=[0, 1, 2])
+        
+        print("Plotting sequence prediction for sample 0...")
+        forecaster.plot_sequence_prediction(X_test, y_test, predictions, index=0)
+        
+        print("Plotting hidden state correlation...")
+        # Select specific features for correlation analysis
+        feature_indices = [
+            forecaster.feature_columns.index('system_price'), 
+            forecaster.feature_columns.index('trading_volume'), 
+            forecaster.feature_columns.index('volume_imbalance')
+        ]
+        forecaster.plot_hidden_state_correlation(hidden_states, X_test, feature_indices=feature_indices)
+        
+        print("Plotting hidden states PCA...")
+        forecaster.plot_hidden_states_pca(hidden_states, n_components=2)
+        
+        print("Performing SHAP feature importance analysis...")
+        # Select a sample of data for SHAP analysis
+        shap_sample_size = min(100, X_test.shape[0])
+        forecaster.perform_shap_analysis(X_test[:shap_sample_size], y_test[:shap_sample_size])
+        
+        print("Plotting residuals decomposition...")
+        forecaster.plot_residuals_decomposition(errors)
+        
+        print("Plotting residuals dynamics...")
+        forecaster.plot_residuals_dynamics(errors)
+        
+        print("Plotting hidden states heatmap...")
+        forecaster.plot_hidden_states_heatmap(hidden_states)
+
         # Generate detailed report
         print("\nGenerating detailed prediction report...")
         report = forecaster.generate_prediction_report(X_test, y_test, predictions, metrics)
         
-        # Additional Economic Analyses
-        print("\nPerforming additional economic analyses...")
-        
-        # 1. Supply and Demand Curve
-        forecaster.plot_supply_demand_curves(df)
-        
-        # 2. Price Elasticity of Demand
-        elasticity_df = forecaster.calculate_price_elasticity(df)
-        
-        # 3. Price Volatility Analysis
-        volatility_df = forecaster.analyze_price_volatility(df)
-        
-        # 4. Seasonal Patterns
-        df = forecaster.analyze_seasonal_patterns(df)
-        
-        # 5. Profit Margins
-        df = forecaster.analyze_profit_margins(df, marginal_cost=10)
-        
-        # 6. Load Duration Curve
-        forecaster.plot_load_duration_curve(df)
-        
-        # 7. Sensitivity Analysis
+        # Example of performing sensitivity analysis
+        print("\nPerforming sensitivity analysis on 'trading_volume'...")
         change_percentages = [-10, -5, 0, 5, 10]
         sensitivity_results = forecaster.perform_sensitivity_analysis(df, 'trading_volume', change_percentages)
-        
-        # 8. Demand Forecasting
-        df = forecaster.forecast_demand(df)
+        print("Sensitivity Analysis Results:")
+        for pct, avg_price in sensitivity_results.items():
+            print(f"Change: {pct}%, Average Predicted Price: {avg_price:.4f} JPY/kWh")
         
         print("\nAll results have been saved to the 'outputs_LSTM' directory.")
         
         return {
             'predictions': predictions,
             'metrics': metrics,
-            'hourly_metrics': hourly_metrics,
-            'report': report,
-            'elasticity_df': elasticity_df,
-            'volatility_df': volatility_df,
-            'sensitivity_results': sensitivity_results
+            'errors': errors,
+            'report': report
         }
         
     except Exception as e:

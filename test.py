@@ -9,16 +9,13 @@ import xgboost as xgb
 from sklearn.model_selection import train_test_split
 import os
 import warnings
+warnings.filterwarnings('ignore')
 
 # Additional imports for advanced visualizations
 import shap
 from sklearn.inspection import PartialDependenceDisplay
 from sklearn.model_selection import learning_curve
 import statsmodels.api as sm
-warnings.filterwarnings('ignore')
-
-# For statistical tests
-from statsmodels.tsa.stattools import coint, adfuller
 
 class JPEXPriceForecastXGB:
     def __init__(self, output_dir='outputs_XGB'):
@@ -51,7 +48,8 @@ class JPEXPriceForecastXGB:
             'システムプライス(円/kWh)': 'system_price'
         }
         df = df.rename(columns=columns)
-        
+
+        # Add 'date' column manually
         df['date'] = '2024-01-01'  # 替换为实际日期
         df['date'] = pd.to_datetime(df['date'])
         print("Added 'date' column manually.")
@@ -110,6 +108,11 @@ class JPEXPriceForecastXGB:
         features.extend(lag_features)
         features.extend(ma_features)
         
+        # Check if all features exist in df
+        missing_features = [feature for feature in features if feature not in df.columns]
+        if missing_features:
+            raise ValueError(f"The following required features are missing from the DataFrame: {missing_features}")
+        
         self.feature_columns = features
         X = df[features]
         y = df['system_price']
@@ -117,7 +120,7 @@ class JPEXPriceForecastXGB:
         return X, y
     
     def train_model(self, X_train, y_train, X_val=None, y_val=None):
-        """Train XGBoost model."""
+        """Train XGBoost model and record evaluation metrics."""
         self.model = xgb.XGBRegressor(
             n_estimators=2000,
             learning_rate=0.01,
@@ -126,7 +129,8 @@ class JPEXPriceForecastXGB:
             subsample=0.8,
             colsample_bytree=0.8,
             tree_method='hist',
-            random_state=42
+            random_state=42,
+            eval_metric='rmse'
         )
         
         eval_set = [(X_train, y_train)]
@@ -137,31 +141,34 @@ class JPEXPriceForecastXGB:
             X_train, 
             y_train,
             eval_set=eval_set,
-            verbose=100
+            verbose=100,
         )
-    
-    def predict(self, X):
-        """Generate predictions."""
-        if self.model is None:
-            raise ValueError("Model has not been trained yet. Please train the model first.")
-        return self.model.predict(X)
-    
-    def evaluate(self, X_test, y_test):
-        """Evaluate model performance."""
-        if self.model is None:
-            raise ValueError("Model has not been trained yet. Please train the model first.")
-            
-        predictions = self.predict(X_test)
-        mse = mean_squared_error(y_test, predictions)
-        mae = mean_absolute_error(y_test, predictions)
-        r2 = r2_score(y_test, predictions)
         
-        return {
-            'mse': mse,
-            'mae': mae,
-            'r2': r2,
-            'rmse': np.sqrt(mse)
-        }
+        # Retrieve evaluation results
+        evals_result = self.model.evals_result()
+        self.evals_result = evals_result
+    
+    def plot_training_history(self):
+        """Plot training and validation RMSE over iterations."""
+        if not hasattr(self, 'evals_result'):
+            raise AttributeError("No evaluation results found. Please train the model first.")
+        
+        epochs = len(self.evals_result['validation_0']['rmse'])
+        x_axis = range(0, epochs)
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(x_axis, self.evals_result['validation_0']['rmse'], label='Train')
+        plt.plot(x_axis, self.evals_result['validation_1']['rmse'], label='Validation')
+        plt.xlabel('Boosting Iterations')
+        plt.ylabel('RMSE')
+        plt.title('XGBoost Training and Validation RMSE')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'training_history.png'))
+        plt.close()
+
+        print("Training history plot saved successfully.")
     
     def plot_feature_importance(self):
         """Plot feature importance."""
@@ -179,6 +186,135 @@ class JPEXPriceForecastXGB:
         plt.close()
         
         return importance
+    
+    def plot_shap_values(self, X_train, num_features=20):
+        """Plot SHAP summary and dependence plots."""
+        # Create SHAP explainer
+        explainer = shap.Explainer(self.model)
+        shap_values = explainer(X_train)
+
+        # SHAP summary plot (bar)
+        plt.figure(figsize=(12, 8))
+        shap.summary_plot(shap_values, X_train, plot_type="bar", show=False)
+        plt.title('SHAP Feature Importance')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'shap_feature_importance.png'))
+        plt.close()
+
+        # SHAP summary plot (dot)
+        plt.figure(figsize=(12, 8))
+        shap.summary_plot(shap_values, X_train, show=False)
+        plt.title('SHAP Feature Impact')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'shap_summary.png'))
+        plt.close()
+
+        # SHAP dependence plots for top features
+        top_features = self.model.feature_names_in_[:num_features]
+        for feature in top_features:
+            plt.figure(figsize=(10, 6))
+            shap.dependence_plot(feature, shap_values.values, X_train, show=False)
+            plt.title(f'SHAP Dependence Plot for {feature}')
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.plots_dir, f'shap_dependence_{feature}.png'))
+            plt.close()
+
+        print("SHAP plots saved successfully.")
+    
+    def plot_partial_dependence(self, X_train, features, grid_resolution=100):
+        """Plot Partial Dependence Plots for specified features."""
+        plt.figure(figsize=(12, 8))
+        PartialDependenceDisplay.from_estimator(
+            self.model, X_train, features, grid_resolution=grid_resolution, 
+            kind='average', ax=plt.gca()
+        )
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'partial_dependence.png'))
+        plt.close()
+
+        print("Partial Dependence Plot saved successfully.")
+    
+    def plot_learning_curve(self, X, y, cv=5, scoring='neg_mean_squared_error'):
+        """Plot learning curves for the model."""
+        train_sizes, train_scores, val_scores = learning_curve(
+            self.model, X, y, cv=cv, scoring=scoring,
+            train_sizes=np.linspace(0.1, 1.0, 10), n_jobs=-1
+        )
+        
+        train_scores_mean = -train_scores.mean(axis=1)
+        val_scores_mean = -val_scores.mean(axis=1)
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(train_sizes, train_scores_mean, 'o-', color='r', label='Training Error')
+        plt.plot(train_sizes, val_scores_mean, 'o-', color='g', label='Validation Error')
+        plt.xlabel('Training Set Size')
+        plt.ylabel('Error (MSE)')
+        plt.title('Learning Curve')
+        plt.legend(loc='best')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'learning_curve.png'))
+        plt.close()
+
+        print("Learning Curve plot saved successfully.")
+    
+    def plot_residuals_autocorrelation(self, y_test, predictions, lags=20):
+        """Plot autocorrelation of residuals."""
+        residuals = y_test - predictions
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        sm.graphics.tsa.plot_acf(residuals, lags=lags, ax=ax)
+        plt.title('Autocorrelation of Residuals')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'residuals_autocorrelation.png'))
+        plt.close()
+
+        print("Residuals Autocorrelation plot saved successfully.")
+    
+    def plot_residuals_time_series(self, y_test, predictions):
+        """Plot residuals over time."""
+        residuals = y_test - predictions
+        plt.figure(figsize=(15, 6))
+        plt.plot(y_test.index, residuals, label='Residuals', color='purple')
+        plt.axhline(0, color='black', linestyle='--', linewidth=1)
+        plt.title('Prediction Residuals Over Time')
+        plt.xlabel('Time')
+        plt.ylabel('Residual (JPY/kWh)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'residuals_time_series.png'))
+        plt.close()
+
+        print("Residuals Time Series plot saved successfully.")
+    
+    def plot_predicted_actual_distribution(self, y_test, predictions):
+        """Plot distribution comparison between predicted and actual values."""
+        plt.figure(figsize=(10, 6))
+        sns.kdeplot(y_test, label='Actual', shade=True, color='blue')
+        sns.kdeplot(predictions, label='Predicted', shade=True, color='orange')
+        plt.title('Distribution of Actual vs Predicted Prices')
+        plt.xlabel('Price (JPY/kWh)')
+        plt.ylabel('Density')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'predicted_actual_distribution.png'))
+        plt.close()
+
+        print("Predicted vs Actual Distribution plot saved successfully.")
+    
+    def plot_feature_correlation(self, df):
+        """Plot correlation matrix heatmap for features."""
+        plt.figure(figsize=(16, 14))
+        correlation_matrix = df[self.feature_columns].corr()
+        sns.heatmap(correlation_matrix, annot=True, fmt=".2f", cmap='coolwarm', linewidths=0.5)
+        plt.title('Feature Correlation Matrix')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'feature_correlation_heatmap.png'))
+        plt.close()
+
+        print("Feature Correlation Heatmap saved successfully.")
     
     def visualize_predictions(self, X_test, y_test, predictions):
         """Create visualizations for predictions and errors."""
@@ -203,6 +339,7 @@ class JPEXPriceForecastXGB:
         plt.ylabel('Price (JPY/kWh)')
         plt.legend()
         plt.grid(True, alpha=0.3)
+        plt.tight_layout()
         plt.savefig(os.path.join(self.plots_dir, 'prediction_with_ci.png'))
         plt.close()
         
@@ -268,6 +405,7 @@ class JPEXPriceForecastXGB:
         plt.xlabel('Actual Price (JPY/kWh)')
         plt.ylabel('Predicted Price (JPY/kWh)')
         plt.grid(True, alpha=0.3)
+        plt.tight_layout()
         plt.savefig(os.path.join(self.plots_dir, 'scatter_plot.png'))
         plt.close()
         
@@ -443,7 +581,7 @@ class JPEXPriceForecastXGB:
 1. Schedule high-consumption activities during {int(stats['Off-Peak Hours']['Lowest Hour']):02d}:00 when prices are lowest.
 2. Avoid peak consumption during {int(stats['Peak Hours (8:00-20:00)']['Peak Hour']):02d}:00 when prices are highest.
 3. Consider load shifting from peak to off-peak hours to optimize costs.
-"""
+    """
         # Save report
         self.generate_report(report, report_name='future_forecast_report.md')
         
@@ -507,223 +645,18 @@ class JPEXPriceForecastXGB:
 - Max Underestimation: {report['Error Analysis']['Max Underestimation']:.4f}
 - Max Overestimation: {report['Error Analysis']['Max Overestimation']:.4f}
 - Error Range: {report['Error Analysis']['Error Range']:.4f}
-"""
+    """
         # Save report
         self.generate_report(report_content, report_name='prediction_report.md')
         
         # Print report summary
         print("\nDetailed Prediction Report:")
-        for section, metrics in report.items():
+        for section, metrics_section in report.items():
             print(f"\n{section}:")
-            for metric, value in metrics.items():
+            for metric, value in metrics_section.items():
                 print(f"{metric}: {value:.4f}")
                 
         return report
-
-    # 添加经济学分析方法
-    def plot_supply_demand_curves(self, df, time_period=None):
-        """Plot supply and demand curves for a specific time period."""
-        # If time_period is None, use the last available period
-        if time_period is None:
-            time_period = df['datetime'].iloc[-1]
-        else:
-            time_period = pd.to_datetime(time_period)
-        
-        # Filter data for the specified time period
-        df_period = df[df['datetime'] == time_period]
-        
-        if df_period.empty:
-            print(f"No data available for {time_period}")
-            return
-        
-        # Assuming 'system_price', 'sell_volume', and 'buy_volume' are available
-        price_points = df_period['system_price'].unique()
-        sell_volumes = df_period.groupby('system_price')['sell_volume'].sum().sort_index()
-        buy_volumes = df_period.groupby('system_price')['buy_volume'].sum().sort_index(ascending=False)
-        
-        cumulative_supply = sell_volumes.cumsum()
-        cumulative_demand = buy_volumes.cumsum()
-        
-        # Plotting
-        plt.figure(figsize=(10, 6))
-        plt.plot(cumulative_supply, sell_volumes.index, label='Supply Curve', drawstyle='steps-post')
-        plt.plot(cumulative_demand, buy_volumes.index, label='Demand Curve', drawstyle='steps-post')
-        
-        # Equilibrium point (approximate)
-        equilibrium_price = df_period['system_price'].iloc[0]
-        equilibrium_quantity = cumulative_supply.iloc[0]
-        
-        plt.axhline(equilibrium_price, color='gray', linestyle='--', alpha=0.7)
-        plt.axvline(equilibrium_quantity, color='gray', linestyle='--', alpha=0.7)
-        
-        plt.title(f'Supply and Demand Curves on {time_period}')
-        plt.xlabel('Cumulative Quantity (kWh)')
-        plt.ylabel('Price (JPY/kWh)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, f'supply_demand_{time_period}.png'))
-        plt.close()
-    
-    def calculate_price_elasticity(self, df):
-        """Calculate and plot price elasticity of demand."""
-        # Calculate percentage changes
-        df['pct_change_price'] = df['system_price'].pct_change()
-        df['pct_change_demand'] = df['buy_volume'].pct_change()
-        
-        # Avoid division by zero
-        df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=['pct_change_price', 'pct_change_demand'])
-        
-        # Calculate elasticity
-        df['elasticity'] = df['pct_change_demand'] / df['pct_change_price']
-        
-        # Plot elasticity over time
-        plt.figure(figsize=(15, 8))
-        plt.plot(df['datetime'], df['elasticity'], label='Price Elasticity of Demand')
-        plt.title('Price Elasticity of Demand Over Time')
-        plt.xlabel('Time')
-        plt.ylabel('Elasticity')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'price_elasticity.png'))
-        plt.close()
-        
-        # Return elasticity DataFrame
-        return df[['datetime', 'elasticity']]
-    
-    def analyze_price_volatility(self, df):
-        """Analyze and plot price volatility."""
-        # Calculate rolling standard deviation
-        df['price_volatility'] = df['system_price'].rolling(window=48).std()
-        
-        # Plot volatility over time
-        plt.figure(figsize=(15, 8))
-        plt.plot(df['datetime'], df['price_volatility'], label='Price Volatility')
-        plt.title('Electricity Price Volatility Over Time')
-        plt.xlabel('Time')
-        plt.ylabel('Volatility (Standard Deviation)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'price_volatility.png'))
-        plt.close()
-        
-        # Return volatility DataFrame
-        return df[['datetime', 'price_volatility']]
-    
-    def analyze_seasonal_patterns(self, df):
-        """Analyze and plot seasonal patterns."""
-        # Extract date components
-        df['month'] = df['datetime'].dt.month
-        df['weekday'] = df['datetime'].dt.weekday
-        df['is_weekend'] = df['weekday'] >= 5
-        
-        # Monthly average prices
-        monthly_prices = df.groupby('month')['system_price'].mean()
-        
-        # Plot monthly average prices
-        plt.figure(figsize=(10, 6))
-        monthly_prices.plot(kind='bar')
-        plt.title('Average Electricity Price by Month')
-        plt.xlabel('Month')
-        plt.ylabel('Price (JPY/kWh)')
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'monthly_average_prices.png'))
-        plt.close()
-        
-        # Weekday vs Weekend prices
-        plt.figure(figsize=(8, 6))
-        sns.boxplot(x='is_weekend', y='system_price', data=df)
-        plt.title('Electricity Price: Weekday vs Weekend')
-        plt.xlabel('Is Weekend')
-        plt.ylabel('Price (JPY/kWh)')
-        plt.savefig(os.path.join(self.plots_dir, 'weekday_weekend_prices.png'))
-        plt.close()
-        
-        # Return DataFrame with seasonal features
-        return df
-    
-    def analyze_profit_margins(self, df, marginal_cost):
-        """Analyze profit margins given a marginal cost."""
-        df['profit_margin'] = df['system_price'] - marginal_cost
-        
-        # Plot profit margins over time
-        plt.figure(figsize=(15, 8))
-        plt.plot(df['datetime'], df['profit_margin'], label='Profit Margin')
-        plt.title('Profit Margins Over Time')
-        plt.xlabel('Time')
-        plt.ylabel('Profit Margin (JPY/kWh)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'profit_margins.png'))
-        plt.close()
-        
-        # Return DataFrame with profit margins
-        return df
-    
-    def plot_load_duration_curve(self, df):
-        """Plot the load duration curve."""
-        # Sort demand data
-        sorted_demand = df['buy_volume'].sort_values(ascending=False).reset_index(drop=True)
-        time_percentile = np.linspace(0, 100, len(sorted_demand))
-        
-        # Plotting
-        plt.figure(figsize=(10, 6))
-        plt.plot(time_percentile, sorted_demand)
-        plt.title('Load Duration Curve')
-        plt.xlabel('Time Percentile (%)')
-        plt.ylabel('Demand (kWh)')
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'load_duration_curve.png'))
-        plt.close()
-    
-    def perform_sensitivity_analysis(self, df, variable, change_percentages):
-        """Perform sensitivity analysis on a specific variable."""
-        original_values = df[variable].copy()
-        results = {}
-        
-        for pct_change in change_percentages:
-            df[variable] = original_values * (1 + pct_change / 100)
-            predictions = self.predict(df[self.feature_columns])
-            average_price = predictions.mean()
-            results[pct_change] = average_price
-        
-        # Restore original values
-        df[variable] = original_values
-        
-        # Plotting
-        plt.figure(figsize=(10, 6))
-        plt.plot(list(results.keys()), list(results.values()), marker='o')
-        plt.title(f'Sensitivity Analysis on {variable}')
-        plt.xlabel('Percentage Change (%)')
-        plt.ylabel('Average Predicted Price (JPY/kWh)')
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, f'sensitivity_{variable}.png'))
-        plt.close()
-        
-        # Return results
-        return results
-    
-    def forecast_demand(self, df):
-        """Forecast future electricity demand."""
-        # Use historical demand data
-        demand_series = df['buy_volume']
-        
-        # Simple Moving Average Forecast as an example
-        df['demand_forecast'] = demand_series.rolling(window=48).mean().shift(1)
-        
-        # Plot forecast vs actual
-        plt.figure(figsize=(15, 8))
-        plt.plot(df['datetime'], df['buy_volume'], label='Actual Demand')
-        plt.plot(df['datetime'], df['demand_forecast'], label='Forecasted Demand', alpha=0.7)
-        plt.title('Electricity Demand Forecast')
-        plt.xlabel('Time')
-        plt.ylabel('Demand (kWh)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(self.plots_dir, 'demand_forecast.png'))
-        plt.close()
-        
-        # Return DataFrame with forecast
-        return df
 
 def main():
     try:
@@ -738,6 +671,13 @@ def main():
         
         print("Preparing features...")
         X, y = forecaster.prepare_features(df)
+        
+        # 确认 self.feature_columns 已被正确设置
+        print(f"Feature columns: {forecaster.feature_columns}")
+        
+        # 绘制特征相关性热图
+        print("\nPlotting Feature Correlation Heatmap...")
+        forecaster.plot_feature_correlation(df)
         
         print("Splitting data...")
         # Use the last two days of data as the test set
@@ -755,6 +695,23 @@ def main():
         print("Training model...")
         forecaster.train_model(X_train, y_train, X_val, y_val)
         
+        # Plot training history
+        print("\nPlotting Training History...")
+        forecaster.plot_training_history()
+        
+        # Generate SHAP plots
+        print("\nGenerating SHAP plots...")
+        forecaster.plot_shap_values(X_train, num_features=20)
+        
+        # Generate Partial Dependence Plots
+        print("\nGenerating Partial Dependence Plots...")
+        top_features = forecaster.model.feature_names_in_[:5]  # 选择前5个重要特征
+        forecaster.plot_partial_dependence(X_train, features=top_features)
+        
+        # Generate Learning Curve
+        print("\nGenerating Learning Curve...")
+        forecaster.plot_learning_curve(X_train_val, y_train_val)
+        
         print("Making predictions...")
         predictions = forecaster.predict(X_test)
         
@@ -771,7 +728,19 @@ def main():
         print("\nGenerating visualizations...")
         hourly_metrics = forecaster.visualize_predictions(X_test, y_test, predictions)
         
-        # Generate detailed report
+        # Plot residuals autocorrelation
+        print("\nPlotting Residuals Autocorrelation...")
+        forecaster.plot_residuals_autocorrelation(y_test, predictions)
+        
+        # Plot residuals time series
+        print("\nPlotting Residuals Time Series...")
+        forecaster.plot_residuals_time_series(y_test, predictions)
+        
+        # Plot predicted vs actual distribution
+        print("\nPlotting Predicted vs Actual Distribution...")
+        forecaster.plot_predicted_actual_distribution(y_test, predictions)
+        
+        # Generate detailed prediction report
         print("\nGenerating detailed prediction report...")
         report = forecaster.generate_prediction_report(X_test, y_test, predictions, metrics)
         
@@ -785,34 +754,6 @@ def main():
         print(f"- Peak hour price ({int(stats['Peak Hours (8:00-20:00)']['Peak Hour']):02d}:00): {stats['Peak Hours (8:00-20:00)']['Max Price']:.2f} JPY/kWh")
         print(f"- Lowest price hour ({int(stats['Off-Peak Hours']['Lowest Hour']):02d}:00): {stats['Off-Peak Hours']['Min Price']:.2f} JPY/kWh")
         
-        # Additional Economic Analyses
-        print("\nPerforming additional economic analyses...")
-        
-        # 1. Supply and Demand Curve
-        forecaster.plot_supply_demand_curves(df)
-        
-        # 2. Price Elasticity of Demand
-        elasticity_df = forecaster.calculate_price_elasticity(df)
-        
-        # 3. Price Volatility Analysis
-        volatility_df = forecaster.analyze_price_volatility(df)
-        
-        # 4. Seasonal Patterns
-        df = forecaster.analyze_seasonal_patterns(df)
-        
-        # 5. Profit Margins
-        df = forecaster.analyze_profit_margins(df, marginal_cost=10)
-        
-        # 6. Load Duration Curve
-        forecaster.plot_load_duration_curve(df)
-        
-        # 7. Sensitivity Analysis
-        change_percentages = [-10, -5, 0, 5, 10]
-        sensitivity_results = forecaster.perform_sensitivity_analysis(df, 'trading_volume', change_percentages)
-        
-        # 8. Demand Forecasting
-        df = forecaster.forecast_demand(df)
-        
         print("\nAll results have been saved to the 'outputs_XGB' directory.")
         
         return {
@@ -821,10 +762,7 @@ def main():
             'hourly_metrics': hourly_metrics,
             'report': report,
             'future_predictions': future_predictions,
-            'future_stats': stats,
-            'elasticity_df': elasticity_df,
-            'volatility_df': volatility_df,
-            'sensitivity_results': sensitivity_results
+            'future_stats': stats
         }
         
     except Exception as e:
