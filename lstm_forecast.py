@@ -324,7 +324,20 @@ class JPEXPriceForecastLSTM:
         input_size = len(self.feature_columns)
         self.model = LSTMAttentionModel(input_size).to(self.device)
         print("Attention layer added to the model.")
-    
+
+    def plot_future_forecast(self, future_predictions, time_steps):
+        """Plot future price forecast."""
+        plt.figure(figsize=(15, 8))
+        plt.plot(range(len(future_predictions)), future_predictions, label='Future Forecast', color='green')
+        plt.title('Future Price Forecast')
+        plt.xlabel('Future Time Steps')
+        plt.ylabel('Price (JPY/kWh)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.plots_dir, 'future_price_forecast.png'))
+        plt.close()
+        print("Future price forecast plot saved.")
+
     def visualize_predictions(self, X_test, y_test, predictions):
         """Create visualizations for predictions and errors."""
         # Create plots directory if it doesn't exist
@@ -859,7 +872,11 @@ def main():
         print(f"MAE: {metrics['mae']:.4f}")
         print(f"R²: {metrics['r2']:.4f}")
         
-        # Visualizations
+        # Visualization
+        future_time_steps = 48  # Predict for the next 48 time periods
+        future_predictions = forecaster.predict(X_test[:future_time_steps])
+        forecaster.plot_future_forecast(future_predictions, future_time_steps)
+
         print("\nGenerating visualizations...")
         errors = forecaster.visualize_predictions(X_test, y_test, predictions)
         
@@ -881,7 +898,6 @@ def main():
         print("Visualizing attention weights...")
         forecaster.visualize_attention_weights(X_test)
         
-        # 新增可视化方法调用开始
         print("Plotting attention weights for sample 0...")
         forecaster.plot_attention_weights_sample(X_test, y_test, index=0)
         
