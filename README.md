@@ -51,7 +51,7 @@ This project addresses these challenges by building models to predict electricit
 
 - Trained using structured data with explicit feature engineering.
 - Hyperparameters optimized via grid search.
-- Performance evaluated using metrics such as \( R^2 \), MSE, and MAE.
+- Performance evaluated using metrics such as $\ R^2 \$, MSE, and MAE.
 
 ### LSTM
 
@@ -65,13 +65,13 @@ This project addresses these challenges by building models to predict electricit
 
 ### XGBoost
 
-- \( R^2 \): 0.9626
+- $\ R^2 \$: 0.9626
 - **Peak Price**: 11.19 JPY/kWh at 17:00.
 - **Lowest Price**: 10.08 JPY/kWh at 12:00.
 
 ### LSTM
 
-- \( R^2 \): 0.9439
+- $\ R^2 \$: 0.9439
 - **Peak Price**: 14.93 JPY/kWh at 17:00.
 - **Lowest Price**: 0.14 JPY/kWh at 11:00.
 
