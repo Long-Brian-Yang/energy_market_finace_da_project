@@ -78,3 +78,6 @@ This project addresses these challenges by building models to predict electricit
 Both models demonstrated strong performance, with XGBoost excelling in interpretability and LSTM showing flexibility in handling complex patterns.
 
 ---
+
+## github link: 
+https://github.com/Long-Brian-Yang/energy_market_finace_da_project
