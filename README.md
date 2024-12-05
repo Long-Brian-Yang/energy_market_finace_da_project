@@ -73,7 +73,7 @@ This project addresses these challenges by building models to predict electricit
 
 - $\ R^2 \$: 0.9439
 - **Peak Price**: 14.93 JPY/kWh at 17:00.
-- **Lowest Price**: 0.14 JPY/kWh at 11:00.
+- **Lowest Price**: 10.14 JPY/kWh at 11:00.
 
 Both models demonstrated strong performance, with XGBoost excelling in interpretability and LSTM showing flexibility in handling complex patterns.
 
